@@ -2,11 +2,11 @@ import asyncio
 from time import perf_counter
 
 import typer
-from openai import AsyncOpenAI
 from pydantic import ValidationError
 from rich.console import Console
 
 from contextshift.config import Settings
+from contextshift.llm import DeepSeekProvider, ModelRequest
 
 app = typer.Typer(
     name="contextshift",
@@ -29,10 +29,7 @@ async def run_smoke_test(prompt: str) -> None:
         console.print(str(exc))
         raise typer.Exit(code=2) from exc
 
-    client = AsyncOpenAI(
-        api_key=settings.deepseek_api_key.get_secret_value(),
-        base_url=settings.deepseek_base_url,
-    )
+    provider = DeepSeekProvider(settings)
 
     started_at = perf_counter()
     first_token_at: float | None = None
@@ -41,33 +38,24 @@ async def run_smoke_test(prompt: str) -> None:
     console.print("[dim]streaming...[/dim]\n")
 
     try:
-        stream = await client.responses.create(
-            model=settings.model,
+        request = ModelRequest(
+            input=prompt,
             instructions=(
                 "直接回答，不复述问题。最多三行。不要使用开场白、总结句或比喻。"
             ),
-            input=prompt,
-            reasoning={"effort": settings.reasoning_effort},
-            max_output_tokens=settings.max_output_tokens,
-            stream=True,
         )
-
-        async for event in stream:
-            if event.type != "response.output_text.delta":
-                continue
-
+        async for delta in provider.stream(request):
             if first_token_at is None:
                 first_token_at = perf_counter()
 
             console.print(
-                event.delta,
+                delta,
                 end="",
                 markup=False,
                 soft_wrap=True,
             )
-
     finally:
-        await client.close()
+        await provider.close()
 
     finished_at = perf_counter()
     console.print("\n")
