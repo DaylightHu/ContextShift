@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-contextshift = "contextshift:main"
+contextshift = "contextshift.cli:app"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
