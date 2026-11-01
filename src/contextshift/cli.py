@@ -6,7 +6,8 @@ from pydantic import ValidationError
 from rich.console import Console
 
 from contextshift.config import Settings
-from contextshift.llm import DeepSeekProvider, ModelRequest
+from contextshift.llm import DeepSeekProvider
+from contextshift.session import Session, TurnDelta
 
 app = typer.Typer(
     name="contextshift",
@@ -30,6 +31,7 @@ async def run_smoke_test(prompt: str) -> None:
         raise typer.Exit(code=2) from exc
 
     provider = DeepSeekProvider(settings)
+    session = Session(provider)
 
     started_at = perf_counter()
     first_token_at: float | None = None
@@ -37,25 +39,24 @@ async def run_smoke_test(prompt: str) -> None:
     console.print(f"[dim]model={settings.model}[/dim]")
     console.print("[dim]streaming...[/dim]\n")
 
-    try:
-        request = ModelRequest(
-            input=prompt,
-            instructions=(
-                "直接回答，不复述问题。最多三行。不要使用开场白、总结句或比喻。"
-            ),
-        )
-        async for delta in provider.stream(request):
-            if first_token_at is None:
-                first_token_at = perf_counter()
+    def render(delta: TurnDelta) -> None:
+        nonlocal first_token_at
 
-            console.print(
-                delta,
-                end="",
-                markup=False,
-                soft_wrap=True,
-            )
+        if first_token_at is None:
+            first_token_at = perf_counter()
+
+        console.print(
+            delta.text,
+            end="",
+            markup=False,
+            soft_wrap=True,
+        )
+
+    try:
+        _, task = session.submit(prompt, render)
+        await task
     finally:
-        await provider.close()
+        await session.close()
 
     finished_at = perf_counter()
     console.print("\n")
