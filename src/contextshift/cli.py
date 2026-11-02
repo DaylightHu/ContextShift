@@ -12,6 +12,7 @@ from contextshift.benchmark import (
     run_latency_benchmark,
 )
 from contextshift.config import Settings
+from contextshift.interactive import run_interactive
 from contextshift.llm import DeepSeekProvider
 from contextshift.session import Session, TurnDelta
 
@@ -124,6 +125,21 @@ async def run_benchmark_command(prompt: str, runs: int) -> None:
     _show_benchmark_summary(summary)
 
 
+async def run_interactive_command() -> None:
+    """Run a persistent text session with real model preemption."""
+
+    settings = load_settings()
+    provider = DeepSeekProvider(settings)
+    session = Session(provider)
+
+    console.print(f"[dim]model={settings.model}[/dim]")
+
+    try:
+        await run_interactive(session, console)
+    finally:
+        await session.close()
+
+
 def _show_benchmark_summary(summary: BenchmarkSummary) -> None:
     table = Table(title="Latency benchmark", show_header=False)
     table.add_column("Metric")
@@ -173,6 +189,17 @@ def benchmark(
 
     try:
         asyncio.run(run_benchmark_command(prompt, runs))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        raise typer.Exit(code=130) from None
+
+
+@app.command()
+def interactive() -> None:
+    """连续输入问题，并用新问题实时抢占旧回答。"""
+
+    try:
+        asyncio.run(run_interactive_command())
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
         raise typer.Exit(code=130) from None
