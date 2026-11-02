@@ -8,6 +8,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
+from contextshift.dialogue import DialogueHistory
 from contextshift.session import Session, TurnDelta, TurnResult
 
 
@@ -30,12 +31,18 @@ async def run_interactive(
     active_turn: ActiveTurn | None = None
     watchers: set[asyncio.Task[None]] = set()
     shutting_down = False
+    history = DialogueHistory()
 
     console.print("[bold cyan]ContextShift interactive[/bold cyan]")
     console.print("输入问题后按回车。新问题会立即抢占旧问题。")
     console.print(
-        "命令：[bold]/cancel[/bold] 取消当前回答，[bold]/quit[/bold] 退出。\n"
+        "命令：[bold]/cancel[/bold] 取消当前回答，"
+        "[bold]/history[/bold] 查看上下文，"
+        "[bold]/clear[/bold] 清空上下文，"
+        "[bold]/quit[/bold] 退出。"
     )
+    console.print("上下文仅保存在当前进程内存；模型回答不会进入历史。")
+    console.print("[yellow]不要输入真实密码、API Key 或其他敏感信息。[/yellow]\n")
 
     def render(delta: TurnDelta) -> None:
         console.print(
@@ -118,10 +125,30 @@ async def run_interactive(
                     session.cancel()
                     continue
 
+                if question == "/clear":
+                    history.clear()
+                    console.print("[dim]会话上下文已清空。[/dim]")
+                    continue
+
+                if question == "/history":
+                    if not history.entries:
+                        console.print("[dim]当前没有会话上下文。[/dim]")
+                        continue
+
+                    console.print(f"[dim]当前保留 {len(history)} 条真实输入：[/dim]")
+                    for index, entry in enumerate(history.entries, start=1):
+                        console.print(
+                            f"{index}. {entry}",
+                            markup=False,
+                        )
+                    continue
+
                 if active_turn is not None and not active_turn.task.done():
                     active_turn.interrupted_at = perf_counter()
 
-                turn_id, task = session.submit(question, render)
+                model_input = history.build_model_input(question)
+                turn_id, task = session.submit(model_input, render)
+                history.append(question)
                 active_turn = ActiveTurn(turn_id=turn_id, task=task)
                 console.print(f"\n[bold cyan][Turn {turn_id}][/bold cyan]")
                 start_watcher(active_turn)
