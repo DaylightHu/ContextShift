@@ -3,6 +3,11 @@ from typing import Literal
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from contextshift.dialogue import (
+    DEFAULT_HISTORY_MAX_CHARACTERS,
+    DEFAULT_HISTORY_MAX_TURNS,
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -31,4 +36,14 @@ class Settings(BaseSettings):
         ge=1,
         le=256,
         validation_alias="CONTEXTSHIFT_MAX_OUTPUT_TOKENS",
+    )
+    history_max_turns: int = Field(
+        default=DEFAULT_HISTORY_MAX_TURNS,
+        ge=1,
+        validation_alias="CONTEXTSHIFT_HISTORY_MAX_TURNS",
+    )
+    history_max_characters: int = Field(
+        default=DEFAULT_HISTORY_MAX_CHARACTERS,
+        ge=1,
+        validation_alias="CONTEXTSHIFT_HISTORY_MAX_CHARACTERS",
     )

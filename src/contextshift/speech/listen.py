@@ -1,4 +1,4 @@
-"""Microphone -> FSMN-VAD -> SenseVoice listener."""
+"""Independent local capture -> FSMN-VAD -> SenseVoice channels."""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -10,7 +10,13 @@ from typing import Any
 
 from contextshift.speech.asr import SenseVoiceTranscriber
 from contextshift.speech.audio import AudioConfig, MicrophoneStream
-from contextshift.speech.events import SpeechStarted, TranscriptReady
+from contextshift.speech.errors import SpeechConfigurationError
+from contextshift.speech.events import (
+    AudioSource,
+    SpeechStarted,
+    TranscriptReady,
+    role_for_source,
+)
 from contextshift.speech.vad import FsmnVad, VadSegment
 
 SpeechStartedHandler = Callable[[SpeechStarted], None]
@@ -23,13 +29,19 @@ class _TranscriptionJob:
     segment: VadSegment
     samples: Any
     duration: float
+    source: AudioSource = "microphone"
 
 
 class _SpeechEventTracker:
     """Assign stable IDs and emit exactly one start event per utterance."""
 
-    def __init__(self, handler: SpeechStartedHandler | None) -> None:
+    def __init__(
+        self,
+        handler: SpeechStartedHandler | None,
+        source: AudioSource = "microphone",
+    ) -> None:
         self._handler = handler
+        self._source = source
         self._next_id = 0
         self._active_id: int | None = None
         self._active_start_ms: int | None = None
@@ -45,6 +57,7 @@ class _SpeechEventTracker:
             utterance_id=self._active_id,
             start_ms=start_ms,
             detected_at=perf_counter(),
+            source=self._source,
         )
         if self._handler is not None:
             self._handler(event)
@@ -81,6 +94,7 @@ async def _run_transcription_worker(
                 text=text,
                 asr_elapsed=asr_elapsed,
                 rtf=rtf,
+                source=job.source,
             )
             if on_transcript is not None:
                 result = on_transcript(event)
@@ -88,7 +102,8 @@ async def _run_transcription_worker(
                     await result
             else:
                 print(
-                    f"\n[Speech {job.utterance_id}] audio={job.duration:.2f}s "
+                    f"\n[{job.source} Speech {job.utterance_id}] "
+                    f"audio={job.duration:.2f}s "
                     f"ASR={asr_elapsed:.3f}s RTF={rtf:.3f}\n{text}",
                     flush=True,
                 )
@@ -96,8 +111,9 @@ async def _run_transcription_worker(
             queue.task_done()
 
 
-async def run_microphone_listener(
+async def run_audio_listener(
     *,
+    source: AudioSource,
     asr_model_dir: str | Path,
     vad_model_dir: str | Path,
     audio_config: AudioConfig | None = None,
@@ -107,13 +123,14 @@ async def run_microphone_listener(
 ) -> None:
     """Capture until cancelled and transcribe closed VAD segments in order."""
 
+    role_for_source(source)
     config = audio_config or AudioConfig()
     vad = FsmnVad(
         vad_model_dir, sample_rate=config.sample_rate, chunk_ms=config.block_ms
     )
     transcriber = SenseVoiceTranscriber(asr_model_dir, device=asr_device)
     blocks: list[Any] = []
-    tracker = _SpeechEventTracker(on_speech_started)
+    tracker = _SpeechEventTracker(on_speech_started, source)
     transcription_queue: asyncio.Queue[_TranscriptionJob | None] = asyncio.Queue()
     worker = asyncio.create_task(
         _run_transcription_worker(
@@ -121,7 +138,7 @@ async def run_microphone_listener(
             transcriber,
             on_transcript,
         ),
-        name="contextshift-asr-worker",
+        name=f"contextshift-{source}-asr-worker",
     )
 
     def schedule(segment: VadSegment, utterance_id: int) -> None:
@@ -141,13 +158,16 @@ async def run_microphone_listener(
                 segment=segment,
                 samples=samples[start:end],
                 duration=duration,
+                source=source,
             )
         )
 
-    print("开始监听麦克风，按 Ctrl-C 停止。", flush=True)
+    print(f"开始监听 {source}，按 Ctrl-C 停止。", flush=True)
     try:
         with MicrophoneStream(config) as microphone:
             while True:
+                if worker.done():
+                    await worker  # Surface ASR failures instead of capturing forever.
                 try:
                     block = await asyncio.to_thread(microphone.next_block)
                 except TimeoutError:
@@ -160,24 +180,89 @@ async def run_microphone_listener(
                 if vad.pending_start_ms is not None:
                     tracker.ensure_started(vad.pending_start_ms)
     finally:
-        if vad.pending_start_ms is not None and blocks:
-            import numpy as np
+        # Shutdown must not deliver queued transcripts and start fresh model turns.
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
-            samples = np.concatenate(blocks)
-            start = max(0, int(vad.pending_start_ms * config.sample_rate / 1000))
-            end = len(samples)
-            if end > start:
-                duration = (end - start) / config.sample_rate
-                end_ms = int(end * 1000 / config.sample_rate)
-                segment = VadSegment(vad.pending_start_ms, end_ms)
-                utterance_id = tracker.close(segment)
-                transcription_queue.put_nowait(
-                    _TranscriptionJob(
-                        utterance_id=utterance_id,
-                        segment=segment,
-                        samples=samples[start:end],
-                        duration=duration,
-                    )
-                )
-        transcription_queue.put_nowait(None)
-        await worker
+
+async def run_microphone_listener(
+    *,
+    asr_model_dir: str | Path,
+    vad_model_dir: str | Path,
+    audio_config: AudioConfig | None = None,
+    asr_device: str = "cpu",
+    on_speech_started: SpeechStartedHandler | None = None,
+    on_transcript: TranscriptHandler | None = None,
+) -> None:
+    """Keep the standalone microphone transcription command available."""
+
+    await run_audio_listener(
+        source="microphone",
+        asr_model_dir=asr_model_dir,
+        vad_model_dir=vad_model_dir,
+        audio_config=audio_config,
+        asr_device=asr_device,
+        on_speech_started=on_speech_started,
+        on_transcript=on_transcript,
+    )
+
+
+async def run_dual_audio_listener(
+    *,
+    asr_model_dir: str | Path,
+    vad_model_dir: str | Path,
+    microphone_config: AudioConfig,
+    system_config: AudioConfig,
+    asr_device: str = "cpu",
+    on_speech_started: SpeechStartedHandler | None = None,
+    on_transcript: TranscriptHandler | None = None,
+) -> None:
+    """Run isolated VAD/ASR queues for mic and an explicit loopback input.
+
+    The system device must already expose meeting audio as a PortAudio input.
+    Native macOS system-audio capture is a separate adapter, not implemented here.
+    """
+
+    if system_config.device is None:
+        raise SpeechConfigurationError("系统音频必须显式指定回环输入设备。")
+    if microphone_config.device == system_config.device:
+        raise SpeechConfigurationError("麦克风和系统音频必须使用不同的输入设备。")
+    # Resolve the default mic before opening streams; it may be the loopback input.
+    if microphone_config.device is None:
+        from contextshift.speech.audio import _sounddevice
+
+        sd = _sounddevice()
+        mic = sd.query_devices(None, "input")
+        system = sd.query_devices(system_config.device, "input")
+        if mic["index"] == system["index"]:
+            raise SpeechConfigurationError(
+                "默认麦克风与系统音频相同，请用 --input-device 指定独立麦克风。"
+            )
+    # Validate both configs before either task opens a capture stream.
+    _ = microphone_config.block_size, system_config.block_size
+    tasks = [
+        asyncio.create_task(
+            run_audio_listener(
+                source=source,
+                asr_model_dir=asr_model_dir,
+                vad_model_dir=vad_model_dir,
+                audio_config=config,
+                asr_device=asr_device,
+                on_speech_started=on_speech_started,
+                on_transcript=on_transcript,
+            ),
+            name=f"contextshift-{source}-listener",
+        )
+        for source, config in (
+            ("microphone", microphone_config),
+            ("system", system_config),
+        )
+    ]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
