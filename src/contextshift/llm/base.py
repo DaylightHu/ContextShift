@@ -1,6 +1,6 @@
 """Provider-neutral model request and streaming interface."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -16,7 +16,7 @@ class ModelRequest:
 class ModelProvider(Protocol):
     """Stream text deltas from a model and release provider resources."""
 
-    def stream(self, request: ModelRequest) -> AsyncIterator[str]:
+    def stream(self, request: ModelRequest) -> AsyncGenerator[str, None]:
         """Yield text deltas for one request."""
 
         ...

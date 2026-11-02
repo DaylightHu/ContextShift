@@ -4,8 +4,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from math import ceil, floor
 from time import perf_counter
+from typing import Literal
 
+from contextshift.runtime import LimitReason
 from contextshift.session import Session, TurnDelta
+
+BenchmarkFinishReason = Literal[
+    "completed",
+    "local_limit",
+    "empty_response",
+    "error",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +26,8 @@ class BenchmarkResult:
     total: float
     output_characters: int
     error: str | None = None
+    finish_reason: BenchmarkFinishReason = "completed"
+    limit_reason: LimitReason | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -42,6 +53,10 @@ class BenchmarkSummary:
     @property
     def errors(self) -> int:
         return self.runs - self.successes
+
+    @property
+    def local_limits(self) -> int:
+        return sum(result.finish_reason == "local_limit" for result in self.results)
 
     @property
     def ttft_p50(self) -> float | None:
@@ -105,6 +120,8 @@ async def run_latency_benchmark(
         first_token_at: float | None = None
         output_characters = 0
         error: str | None = None
+        finish_reason: BenchmarkFinishReason = "completed"
+        limit_reason: LimitReason | None = None
 
         def record_delta(delta: TurnDelta) -> None:
             nonlocal first_token_at, output_characters
@@ -115,13 +132,18 @@ async def run_latency_benchmark(
 
         try:
             _, task = session.submit(prompt, record_delta)
-            await task
+            turn_result = await task
+            if turn_result.finish_reason == "local_limit":
+                finish_reason = "local_limit"
+                limit_reason = turn_result.limit_reason
         except Exception as exc:  # noqa: BLE001 - each failed run must be recorded
             error = f"{type(exc).__name__}: {exc}"
+            finish_reason = "error"
 
         finished_at = clock()
         if error is None and first_token_at is None:
             error = "Empty response"
+            finish_reason = "empty_response"
 
         result = BenchmarkResult(
             run_number=run_number,
@@ -129,6 +151,8 @@ async def run_latency_benchmark(
             total=finished_at - started_at,
             output_characters=output_characters,
             error=error,
+            finish_reason=finish_reason,
+            limit_reason=limit_reason,
         )
         results.append(result)
 

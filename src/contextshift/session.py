@@ -3,9 +3,15 @@
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from contextshift.llm import ModelProvider, ModelRequest
-from contextshift.runtime import TurnController
+from contextshift.runtime import (
+    LimitReason,
+    ResponseLimiter,
+    ResponseLimits,
+    TurnController,
+)
 
 DEFAULT_INSTRUCTIONS = "直接回答，不复述问题。最多三行。不要使用开场白、总结句或比喻。"
 
@@ -16,6 +22,19 @@ class TurnDelta:
 
     turn_id: int
     text: str
+
+
+TurnFinishReason = Literal["completed", "local_limit", "interrupted"]
+
+
+@dataclass(frozen=True, slots=True)
+class TurnResult:
+    """How a turn finished and how much text reached the renderer."""
+
+    turn_id: int
+    finish_reason: TurnFinishReason
+    output_characters: int
+    limit_reason: LimitReason | None = None
 
 
 DeltaHandler = Callable[[TurnDelta], None]
@@ -30,18 +49,20 @@ class Session:
         *,
         instructions: str = DEFAULT_INSTRUCTIONS,
         turn_controller: TurnController | None = None,
+        response_limits: ResponseLimits | None = None,
     ) -> None:
         self._provider = provider
         self._instructions = instructions
         self._turn_controller = turn_controller or TurnController()
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._response_limits = response_limits or ResponseLimits()
+        self._tasks: set[asyncio.Task[TurnResult]] = set()
         self._closed = False
 
     def submit(
         self,
         question: str,
         on_delta: DeltaHandler,
-    ) -> tuple[int, asyncio.Task[None]]:
+    ) -> tuple[int, asyncio.Task[TurnResult]]:
         """Start a turn, cancelling and invalidating the previous turn."""
 
         if self._closed:
@@ -52,14 +73,41 @@ class Session:
             instructions=self._instructions,
         )
 
-        async def run(turn_id: int) -> None:
-            async for text in self._provider.stream(request):
-                if not self._turn_controller.is_current(turn_id):
-                    break
+        async def run(turn_id: int) -> TurnResult:
+            limiter = ResponseLimiter(self._response_limits)
+            stream = self._provider.stream(request)
 
-                # Keep the current-turn check and rendering synchronous so a new
-                # turn cannot be scheduled between them on the event loop.
-                on_delta(TurnDelta(turn_id=turn_id, text=text))
+            try:
+                async for text in stream:
+                    if not self._turn_controller.is_current(turn_id):
+                        return TurnResult(
+                            turn_id=turn_id,
+                            finish_reason="interrupted",
+                            output_characters=limiter.characters,
+                        )
+
+                    limited = limiter.push(text)
+
+                    # Keep the current-turn check, limiting, and rendering
+                    # synchronous so a new turn cannot be scheduled between them.
+                    if limited.text:
+                        on_delta(TurnDelta(turn_id=turn_id, text=limited.text))
+
+                    if limited.reached_limit:
+                        return TurnResult(
+                            turn_id=turn_id,
+                            finish_reason="local_limit",
+                            output_characters=limiter.characters,
+                            limit_reason=limited.reason,
+                        )
+
+                return TurnResult(
+                    turn_id=turn_id,
+                    finish_reason="completed",
+                    output_characters=limiter.characters,
+                )
+            finally:
+                await stream.aclose()
 
         turn_id, task = self._turn_controller.start(run)
         self._tasks.add(task)

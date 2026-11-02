@@ -1,6 +1,6 @@
 """Tests for latency benchmark collection and aggregation."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 import pytest
 
@@ -10,6 +10,7 @@ from contextshift.benchmark import (
     run_latency_benchmark,
 )
 from contextshift.llm import ModelRequest
+from contextshift.runtime import ResponseLimits
 from contextshift.session import Session
 
 
@@ -26,7 +27,7 @@ class BenchmarkProvider:
         self.calls = 0
         self.closed = False
 
-    async def stream(self, _: ModelRequest) -> AsyncIterator[str]:
+    async def stream(self, _: ModelRequest) -> AsyncGenerator[str, None]:
         self.calls += 1
         if self.calls == 2:
             raise RuntimeError("provider unavailable")
@@ -39,7 +40,7 @@ class BenchmarkProvider:
 
 
 class EmptyProvider:
-    async def stream(self, _: ModelRequest) -> AsyncIterator[str]:
+    async def stream(self, _: ModelRequest) -> AsyncGenerator[str, None]:
         if False:
             yield ""
 
@@ -69,16 +70,19 @@ async def test_benchmark_collects_successes_and_errors() -> None:
     assert summary.runs == 2
     assert summary.successes == 1
     assert summary.errors == 1
+    assert summary.local_limits == 0
 
     success, failure = summary.results
     assert success.ttft == pytest.approx(0.2)
     assert success.total == pytest.approx(0.8)
     assert success.output_characters == 12
     assert success.error is None
+    assert success.finish_reason == "completed"
     assert failure.ttft is None
     assert failure.total == pytest.approx(0.5)
     assert failure.output_characters == 0
     assert failure.error == "RuntimeError: provider unavailable"
+    assert failure.finish_reason == "error"
 
 
 def test_summary_calculates_interpolated_percentiles() -> None:
@@ -140,6 +144,35 @@ async def test_benchmark_records_empty_response_as_error() -> None:
     assert result.ttft is None
     assert result.total == pytest.approx(0.4)
     assert result.error == "Empty response"
+    assert result.finish_reason == "empty_response"
+
+
+@pytest.mark.asyncio
+async def test_benchmark_records_local_limit_as_success() -> None:
+    provider = BenchmarkProvider()
+    session = Session(
+        provider,
+        response_limits=ResponseLimits(
+            max_lines=3,
+            max_characters=5,
+            max_complete_sentences=3,
+        ),
+    )
+
+    summary = await run_latency_benchmark(
+        session,
+        "question",
+        1,
+        clock=SequenceClock([1.0, 1.1, 1.2]),
+    )
+    await session.close()
+
+    result = summary.results[0]
+    assert result.succeeded
+    assert result.finish_reason == "local_limit"
+    assert result.limit_reason == "max_characters"
+    assert result.output_characters == 5
+    assert summary.local_limits == 1
 
 
 @pytest.mark.asyncio

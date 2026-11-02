@@ -65,7 +65,7 @@ async def run_smoke_test(prompt: str) -> None:
 
     try:
         _, task = session.submit(prompt, render)
-        await task
+        turn_result = await task
     finally:
         await session.close()
 
@@ -76,6 +76,12 @@ async def run_smoke_test(prompt: str) -> None:
         console.print(f"[green]TTFT: {first_token_at - started_at:.3f}s[/green]")
 
     console.print(f"[green]Total: {finished_at - started_at:.3f}s[/green]")
+
+    if turn_result.finish_reason == "local_limit":
+        console.print(
+            "[dim]finish_reason=local_limit "
+            f"limit_reason={turn_result.limit_reason}[/dim]"
+        )
 
 
 async def run_benchmark_command(prompt: str, runs: int) -> None:
@@ -94,7 +100,8 @@ async def run_benchmark_command(prompt: str, runs: int) -> None:
                 f"Run {result.run_number}/{runs}: "
                 f"TTFT={result.ttft:.3f}s "
                 f"Total={result.total:.3f}s "
-                f"Characters={result.output_characters}"
+                f"Characters={result.output_characters} "
+                f"Finish={result.finish_reason}"
             )
             return
 
@@ -124,6 +131,7 @@ def _show_benchmark_summary(summary: BenchmarkSummary) -> None:
     table.add_row("Runs", str(summary.runs))
     table.add_row("Success", str(summary.successes))
     table.add_row("Errors", str(summary.errors))
+    table.add_row("Local limits", str(summary.local_limits))
     table.add_row("TTFT P50", _format_seconds(summary.ttft_p50))
     table.add_row("TTFT P95", _format_seconds(summary.ttft_p95))
     table.add_row("Total P50", _format_seconds(summary.total_p50))
