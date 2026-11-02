@@ -1,11 +1,12 @@
 """Tests for turn-aware streaming session orchestration."""
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 import pytest
 
 from contextshift.llm import ModelRequest
+from contextshift.runtime import ResponseLimits
 from contextshift.session import Session, TurnDelta
 
 
@@ -16,7 +17,7 @@ class InterruptResistantProvider:
         self.first_delta_rendered = asyncio.Event()
         self.closed = False
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[str]:
+    async def stream(self, request: ModelRequest) -> AsyncGenerator[str, None]:
         if request.input == "A":
             yield "A1"
             self.first_delta_rendered.set()
@@ -29,6 +30,22 @@ class InterruptResistantProvider:
 
         yield "B1"
         yield "B2"
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class LimitAwareProvider:
+    def __init__(self) -> None:
+        self.stream_closed = asyncio.Event()
+        self.closed = False
+
+    async def stream(self, _: ModelRequest) -> AsyncGenerator[str, None]:
+        try:
+            yield "abcdef"
+            await asyncio.Event().wait()
+        finally:
+            self.stream_closed.set()
 
     async def close(self) -> None:
         self.closed = True
@@ -82,3 +99,30 @@ def test_submit_rejects_closed_session() -> None:
             session.submit("question", lambda _: None)
 
     asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_local_limit_stops_rendering_and_closes_provider_stream() -> None:
+    provider = LimitAwareProvider()
+    session = Session(
+        provider,
+        response_limits=ResponseLimits(
+            max_lines=3,
+            max_characters=3,
+            max_complete_sentences=3,
+        ),
+    )
+    rendered: list[TurnDelta] = []
+
+    turn_id, task = session.submit("question", rendered.append)
+    result = await task
+
+    assert [(delta.turn_id, delta.text) for delta in rendered] == [(turn_id, "abc")]
+    assert result.turn_id == turn_id
+    assert result.finish_reason == "local_limit"
+    assert result.limit_reason == "max_characters"
+    assert result.output_characters == 3
+    assert provider.stream_closed.is_set()
+
+    await session.close()
+    assert provider.closed

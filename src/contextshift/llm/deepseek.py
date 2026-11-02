@@ -1,6 +1,6 @@
 """DeepSeek implementation of the model provider interface."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 from openai import AsyncOpenAI
 
@@ -24,7 +24,7 @@ class DeepSeekProvider:
         )
         self._closed = False
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[str]:
+    async def stream(self, request: ModelRequest) -> AsyncGenerator[str, None]:
         """Yield only text deltas and always close the response stream."""
 
         if self._closed:
