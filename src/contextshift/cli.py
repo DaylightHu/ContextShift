@@ -27,7 +27,7 @@ from contextshift.speech import (
     TranscriptReady,
     list_input_devices,
 )
-from contextshift.speech.listen import run_microphone_listener
+from contextshift.speech.listen import run_dual_audio_listener, run_microphone_listener
 
 app = typer.Typer(
     name="contextshift",
@@ -158,10 +158,11 @@ async def run_live_command(
     asr_model: Path,
     vad_model: Path,
     input_device: int | None,
+    system_device: int,
     block_ms: int,
     asr_device: str,
 ) -> None:
-    """Run the microphone-to-model loop with immediate turn preemption."""
+    """Use mic speech as context and system speech as model questions."""
 
     settings = load_settings()
     session = Session(DeepSeekProvider(settings))
@@ -181,12 +182,15 @@ async def run_live_command(
     def speech_started(event: SpeechStarted) -> None:
         assistant.handle_speech_started(event)
         console.print(
-            f"\n[dim][Speech {event.utterance_id} started; old turn cancelled][/dim]"
+            f"\n[{event.source}/{event.role} Speech {event.utterance_id} started; "
+            f"{'old turn cancelled' if event.source == 'system' else 'context only'}]",
+            style="dim",
+            markup=False,
         )
 
     def transcript_ready(event: TranscriptReady) -> None:
         console.print(
-            f"\n[cyan][Speech {event.utterance_id}][/cyan] {event.text}",
+            f"\n[{event.source}/{event.role} Speech {event.utterance_id}] {event.text}",
             markup=False,
         )
         console.print(f"[dim]ASR={event.asr_elapsed:.3f}s RTF={event.rtf:.3f}[/dim]")
@@ -194,10 +198,11 @@ async def run_live_command(
 
     console.print(f"[dim]model={settings.model}[/dim]")
     try:
-        await run_microphone_listener(
+        await run_dual_audio_listener(
             asr_model_dir=asr_model,
             vad_model_dir=vad_model,
-            audio_config=AudioConfig(block_ms=block_ms, device=input_device),
+            microphone_config=AudioConfig(block_ms=block_ms, device=input_device),
+            system_config=AudioConfig(block_ms=block_ms, device=system_device),
             asr_device=asr_device,
             on_speech_started=speech_started,
             on_transcript=transcript_ready,
@@ -279,7 +284,7 @@ def interactive() -> None:
 
 @app.command("audio-devices")
 def audio_devices() -> None:
-    """列出可用的麦克风输入设备。"""
+    """列出可用的麦克风与回环输入设备。"""
 
     try:
         devices = list_input_devices()
@@ -357,6 +362,10 @@ def listen(
 
 @app.command()
 def live(
+    system_device: Annotated[
+        int,
+        typer.Option("--system-device", min=0, help="承载会议声音的回环输入设备编号"),
+    ],
     asr_model: Annotated[
         Path,
         typer.Option("--asr-model"),
@@ -372,7 +381,7 @@ def live(
     block_ms: Annotated[int, typer.Option(min=100, max=1000)] = 200,
     asr_device: Annotated[str, typer.Option("--asr-device")] = "cpu",
 ) -> None:
-    """麦克风转写问题，并用新讲话立即抢占旧回答。"""
+    """麦克风记录候选人；系统回环音频触发提问并抢占旧回答。"""
 
     try:
         asyncio.run(
@@ -380,6 +389,7 @@ def live(
                 asr_model=asr_model,
                 vad_model=vad_model,
                 input_device=input_device,
+                system_device=system_device,
                 block_ms=block_ms,
                 asr_device=asr_device,
             )
