@@ -24,6 +24,8 @@ class ActiveTurn:
 async def run_interactive(
     session: Session,
     console: Console,
+    *,
+    history: DialogueHistory | None = None,
 ) -> None:
     """Read questions continuously while model turns run in the background."""
 
@@ -31,7 +33,7 @@ async def run_interactive(
     active_turn: ActiveTurn | None = None
     watchers: set[asyncio.Task[None]] = set()
     shutting_down = False
-    history = DialogueHistory()
+    history = history if history is not None else DialogueHistory()
 
     console.print("[bold cyan]ContextShift interactive[/bold cyan]")
     console.print("输入问题后按回车。新问题会立即抢占旧问题。")

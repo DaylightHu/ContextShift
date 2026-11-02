@@ -14,6 +14,7 @@ from contextshift.benchmark import (
     run_latency_benchmark,
 )
 from contextshift.config import Settings
+from contextshift.dialogue import DialogueHistory
 from contextshift.interactive import run_interactive
 from contextshift.live import LiveAssistant
 from contextshift.llm import DeepSeekProvider
@@ -148,7 +149,14 @@ async def run_interactive_command() -> None:
     console.print(f"[dim]model={settings.model}[/dim]")
 
     try:
-        await run_interactive(session, console)
+        await run_interactive(
+            session,
+            console,
+            history=DialogueHistory(
+                max_turns=settings.history_max_turns,
+                max_characters=settings.history_max_characters,
+            ),
+        )
     finally:
         await session.close()
 
@@ -177,7 +185,15 @@ async def run_live_command(
             markup=False,
         )
 
-    assistant = LiveAssistant(session, render, on_error=show_error)
+    assistant = LiveAssistant(
+        session,
+        render,
+        history=DialogueHistory(
+            max_turns=settings.history_max_turns,
+            max_characters=settings.history_max_characters,
+        ),
+        on_error=show_error,
+    )
 
     def speech_started(event: SpeechStarted) -> None:
         assistant.handle_speech_started(event)

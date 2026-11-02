@@ -6,6 +6,8 @@ from typing import Literal
 
 DialogueRole = Literal["user", "candidate", "interviewer"]
 _ROLE_LABELS = {"user": "用户", "candidate": "候选人", "interviewer": "面试官"}
+DEFAULT_HISTORY_MAX_TURNS = 64
+DEFAULT_HISTORY_MAX_CHARACTERS = 12_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,8 +24,8 @@ class DialogueHistory:
     def __init__(
         self,
         *,
-        max_turns: int = 8,
-        max_characters: int = 2000,
+        max_turns: int = DEFAULT_HISTORY_MAX_TURNS,
+        max_characters: int = DEFAULT_HISTORY_MAX_CHARACTERS,
     ) -> None:
         if max_turns < 1:
             raise ValueError("max_turns must be at least 1")
@@ -77,7 +79,7 @@ class DialogueHistory:
                 remaining -= len(entry.text)
                 continue
 
-            if not selected and remaining > 0:
+            if remaining > 0:
                 selected.append(DialogueEntry(entry.text[-remaining:], entry.role))
             break
 
