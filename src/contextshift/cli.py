@@ -1,5 +1,7 @@
 import asyncio
+from pathlib import Path
 from time import perf_counter
+from typing import Annotated
 
 import typer
 from pydantic import ValidationError
@@ -15,6 +17,14 @@ from contextshift.config import Settings
 from contextshift.interactive import run_interactive
 from contextshift.llm import DeepSeekProvider
 from contextshift.session import Session, TurnDelta
+from contextshift.speech import (
+    AudioConfig,
+    SenseVoiceTranscriber,
+    SpeechConfigurationError,
+    SpeechDependencyError,
+    list_input_devices,
+)
+from contextshift.speech.listen import run_microphone_listener
 
 app = typer.Typer(
     name="contextshift",
@@ -167,6 +177,11 @@ def _format_seconds(value: float | None) -> str:
     return f"{value:.3f}s" if value is not None else "n/a"
 
 
+def _speech_error(exc: SpeechConfigurationError | SpeechDependencyError) -> None:
+    console.print(f"[red]{exc}[/red]")
+    raise typer.Exit(code=2) from exc
+
+
 @app.command()
 def smoke(
     prompt: str = typer.Argument("为什么高并发缓存通常需要读写锁？"),
@@ -203,3 +218,81 @@ def interactive() -> None:
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/yellow]")
         raise typer.Exit(code=130) from None
+
+
+@app.command("audio-devices")
+def audio_devices() -> None:
+    """列出可用的麦克风输入设备。"""
+
+    try:
+        devices = list_input_devices()
+    except (SpeechConfigurationError, SpeechDependencyError) as exc:
+        _speech_error(exc)
+    if not devices:
+        console.print("[yellow]没有检测到可用的输入设备。[/yellow]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Index")
+    table.add_column("Name")
+    table.add_column("Inputs", justify="right")
+    table.add_column("Default Hz", justify="right")
+    for device in devices:
+        table.add_row(
+            str(device.index),
+            device.name,
+            str(device.max_input_channels),
+            f"{device.default_sample_rate:.0f}",
+        )
+    console.print(table)
+
+
+@app.command()
+def transcribe(
+    audio_file: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    asr_model: Annotated[
+        Path,
+        typer.Option("--asr-model"),
+    ] = Path("models/asr/SenseVoiceSmall"),
+    device: Annotated[str, typer.Option("--device")] = "cpu",
+) -> None:
+    """用本地 SenseVoiceSmall 转写一个音频文件。"""
+
+    try:
+        text = SenseVoiceTranscriber(asr_model, device=device).transcribe(audio_file)
+    except (SpeechConfigurationError, SpeechDependencyError) as exc:
+        _speech_error(exc)
+    console.print(text, markup=False)
+
+
+@app.command()
+def listen(
+    asr_model: Annotated[
+        Path,
+        typer.Option("--asr-model"),
+    ] = Path("models/asr/SenseVoiceSmall"),
+    vad_model: Annotated[
+        Path,
+        typer.Option("--vad-model"),
+    ] = Path("models/vad/fsmn-vad"),
+    input_device: Annotated[
+        int | None,
+        typer.Option(min=0),
+    ] = None,
+    block_ms: Annotated[int, typer.Option(min=100, max=1000)] = 200,
+    asr_device: Annotated[str, typer.Option("--asr-device")] = "cpu",
+) -> None:
+    """麦克风 → FSMN-VAD 切句 → SenseVoice 本地转写。"""
+
+    try:
+        asyncio.run(
+            run_microphone_listener(
+                asr_model_dir=asr_model,
+                vad_model_dir=vad_model,
+                audio_config=AudioConfig(block_ms=block_ms, device=input_device),
+                asr_device=asr_device,
+            )
+        )
+    except (SpeechConfigurationError, SpeechDependencyError) as exc:
+        _speech_error(exc)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]已停止监听。[/yellow]")
