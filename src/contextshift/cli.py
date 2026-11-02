@@ -15,6 +15,7 @@ from contextshift.benchmark import (
 )
 from contextshift.config import Settings
 from contextshift.interactive import run_interactive
+from contextshift.live import LiveAssistant
 from contextshift.llm import DeepSeekProvider
 from contextshift.session import Session, TurnDelta
 from contextshift.speech import (
@@ -22,6 +23,8 @@ from contextshift.speech import (
     SenseVoiceTranscriber,
     SpeechConfigurationError,
     SpeechDependencyError,
+    SpeechStarted,
+    TranscriptReady,
     list_input_devices,
 )
 from contextshift.speech.listen import run_microphone_listener
@@ -147,6 +150,60 @@ async def run_interactive_command() -> None:
     try:
         await run_interactive(session, console)
     finally:
+        await session.close()
+
+
+async def run_live_command(
+    *,
+    asr_model: Path,
+    vad_model: Path,
+    input_device: int | None,
+    block_ms: int,
+    asr_device: str,
+) -> None:
+    """Run the microphone-to-model loop with immediate turn preemption."""
+
+    settings = load_settings()
+    session = Session(DeepSeekProvider(settings))
+
+    def render(delta: TurnDelta) -> None:
+        console.print(delta.text, end="", markup=False, soft_wrap=True)
+
+    def show_error(exc: BaseException) -> None:
+        console.print(
+            f"\n{type(exc).__name__}: {exc}",
+            style="red",
+            markup=False,
+        )
+
+    assistant = LiveAssistant(session, render, on_error=show_error)
+
+    def speech_started(event: SpeechStarted) -> None:
+        assistant.handle_speech_started(event)
+        console.print(
+            f"\n[dim][Speech {event.utterance_id} started; old turn cancelled][/dim]"
+        )
+
+    def transcript_ready(event: TranscriptReady) -> None:
+        console.print(
+            f"\n[cyan][Speech {event.utterance_id}][/cyan] {event.text}",
+            markup=False,
+        )
+        console.print(f"[dim]ASR={event.asr_elapsed:.3f}s RTF={event.rtf:.3f}[/dim]")
+        assistant.handle_transcript(event)
+
+    console.print(f"[dim]model={settings.model}[/dim]")
+    try:
+        await run_microphone_listener(
+            asr_model_dir=asr_model,
+            vad_model_dir=vad_model,
+            audio_config=AudioConfig(block_ms=block_ms, device=input_device),
+            asr_device=asr_device,
+            on_speech_started=speech_started,
+            on_transcript=transcript_ready,
+        )
+    finally:
+        await assistant.close()
         await session.close()
 
 
@@ -296,3 +353,38 @@ def listen(
         _speech_error(exc)
     except KeyboardInterrupt:
         console.print("\n[yellow]已停止监听。[/yellow]")
+
+
+@app.command()
+def live(
+    asr_model: Annotated[
+        Path,
+        typer.Option("--asr-model"),
+    ] = Path("models/asr/SenseVoiceSmall"),
+    vad_model: Annotated[
+        Path,
+        typer.Option("--vad-model"),
+    ] = Path("models/vad/fsmn-vad"),
+    input_device: Annotated[
+        int | None,
+        typer.Option(min=0),
+    ] = None,
+    block_ms: Annotated[int, typer.Option(min=100, max=1000)] = 200,
+    asr_device: Annotated[str, typer.Option("--asr-device")] = "cpu",
+) -> None:
+    """麦克风转写问题，并用新讲话立即抢占旧回答。"""
+
+    try:
+        asyncio.run(
+            run_live_command(
+                asr_model=asr_model,
+                vad_model=vad_model,
+                input_device=input_device,
+                block_ms=block_ms,
+                asr_device=asr_device,
+            )
+        )
+    except (SpeechConfigurationError, SpeechDependencyError) as exc:
+        _speech_error(exc)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]已停止实时助手。[/yellow]")

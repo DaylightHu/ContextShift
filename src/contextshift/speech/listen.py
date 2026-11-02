@@ -2,15 +2,98 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from inspect import isawaitable
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from contextshift.speech.asr import SenseVoiceTranscriber
 from contextshift.speech.audio import AudioConfig, MicrophoneStream
+from contextshift.speech.events import SpeechStarted, TranscriptReady
 from contextshift.speech.vad import FsmnVad, VadSegment
 
-TranscriptHandler = Callable[[str, float, float], Awaitable[None] | None]
+SpeechStartedHandler = Callable[[SpeechStarted], None]
+TranscriptHandler = Callable[[TranscriptReady], Awaitable[None] | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _TranscriptionJob:
+    utterance_id: int
+    segment: VadSegment
+    samples: Any
+    duration: float
+
+
+class _SpeechEventTracker:
+    """Assign stable IDs and emit exactly one start event per utterance."""
+
+    def __init__(self, handler: SpeechStartedHandler | None) -> None:
+        self._handler = handler
+        self._next_id = 0
+        self._active_id: int | None = None
+        self._active_start_ms: int | None = None
+
+    def ensure_started(self, start_ms: int) -> int:
+        if self._active_id is not None and self._active_start_ms == start_ms:
+            return self._active_id
+
+        self._next_id += 1
+        self._active_id = self._next_id
+        self._active_start_ms = start_ms
+        event = SpeechStarted(
+            utterance_id=self._active_id,
+            start_ms=start_ms,
+            detected_at=perf_counter(),
+        )
+        if self._handler is not None:
+            self._handler(event)
+        return self._active_id
+
+    def close(self, segment: VadSegment) -> int:
+        utterance_id = self.ensure_started(segment.start_ms)
+        self._active_id = None
+        self._active_start_ms = None
+        return utterance_id
+
+
+async def _run_transcription_worker(
+    queue: asyncio.Queue[_TranscriptionJob | None],
+    transcriber: SenseVoiceTranscriber,
+    on_transcript: TranscriptHandler | None,
+) -> None:
+    """Transcribe queued utterances serially and preserve callback order."""
+
+    while True:
+        job = await queue.get()
+        try:
+            if job is None:
+                return
+
+            asr_started = perf_counter()
+            text = await asyncio.to_thread(transcriber.transcribe, job.samples)
+            asr_elapsed = perf_counter() - asr_started
+            rtf = asr_elapsed / job.duration if job.duration > 0 else 0.0
+            event = TranscriptReady(
+                utterance_id=job.utterance_id,
+                start_ms=job.segment.start_ms,
+                end_ms=job.segment.end_ms,
+                text=text,
+                asr_elapsed=asr_elapsed,
+                rtf=rtf,
+            )
+            if on_transcript is not None:
+                result = on_transcript(event)
+                if isawaitable(result):
+                    await result
+            else:
+                print(
+                    f"\n[Speech {job.utterance_id}] audio={job.duration:.2f}s "
+                    f"ASR={asr_elapsed:.3f}s RTF={rtf:.3f}\n{text}",
+                    flush=True,
+                )
+        finally:
+            queue.task_done()
 
 
 async def run_microphone_listener(
@@ -19,9 +102,10 @@ async def run_microphone_listener(
     vad_model_dir: str | Path,
     audio_config: AudioConfig | None = None,
     asr_device: str = "cpu",
+    on_speech_started: SpeechStartedHandler | None = None,
     on_transcript: TranscriptHandler | None = None,
 ) -> None:
-    """Capture until cancelled and transcribe closed VAD segments in parallel."""
+    """Capture until cancelled and transcribe closed VAD segments in order."""
 
     config = audio_config or AudioConfig()
     vad = FsmnVad(
@@ -29,28 +113,18 @@ async def run_microphone_listener(
     )
     transcriber = SenseVoiceTranscriber(asr_model_dir, device=asr_device)
     blocks: list[Any] = []
-    tasks: set[asyncio.Task[None]] = set()
-    speech_number = 0
-    started_at: float | None = None
+    tracker = _SpeechEventTracker(on_speech_started)
+    transcription_queue: asyncio.Queue[_TranscriptionJob | None] = asyncio.Queue()
+    worker = asyncio.create_task(
+        _run_transcription_worker(
+            transcription_queue,
+            transcriber,
+            on_transcript,
+        ),
+        name="contextshift-asr-worker",
+    )
 
-    async def transcribe_segment(number: int, segment: Any, duration: float) -> None:
-        asr_started = perf_counter()
-        text = await asyncio.to_thread(transcriber.transcribe, segment)
-        asr_elapsed = perf_counter() - asr_started
-        rtf = asr_elapsed / duration if duration > 0 else 0.0
-        if on_transcript is not None:
-            result = on_transcript(text, asr_elapsed, rtf)
-            if asyncio.iscoroutine(result):
-                await result
-        else:
-            print(
-                f"\n[Speech {number}] audio={duration:.2f}s "
-                f"ASR={asr_elapsed:.3f}s RTF={rtf:.3f}\n{text}",
-                flush=True,
-            )
-
-    def schedule(segment: VadSegment) -> None:
-        nonlocal speech_number
+    def schedule(segment: VadSegment, utterance_id: int) -> None:
         import numpy as np
 
         if not blocks:
@@ -60,14 +134,15 @@ async def run_microphone_listener(
         end = min(len(samples), int(segment.end_ms * config.sample_rate / 1000))
         if end <= start:
             return
-        speech_number += 1
         duration = (end - start) / config.sample_rate
-        task = asyncio.create_task(
-            transcribe_segment(speech_number, samples[start:end], duration),
-            name=f"contextshift-speech-{speech_number}",
+        transcription_queue.put_nowait(
+            _TranscriptionJob(
+                utterance_id=utterance_id,
+                segment=segment,
+                samples=samples[start:end],
+                duration=duration,
+            )
         )
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
 
     print("开始监听麦克风，按 Ctrl-C 停止。", flush=True)
     try:
@@ -79,12 +154,11 @@ async def run_microphone_listener(
                     continue
                 blocks.append(block)
                 segments = await asyncio.to_thread(vad.accept, block)
-                if vad.pending_start_ms is not None and started_at is None:
-                    started_at = perf_counter()
-                    print("检测到讲话", flush=True)
                 for segment in segments:
-                    schedule(segment)
-                    started_at = None
+                    utterance_id = tracker.close(segment)
+                    schedule(segment, utterance_id)
+                if vad.pending_start_ms is not None:
+                    tracker.ensure_started(vad.pending_start_ms)
     finally:
         if vad.pending_start_ms is not None and blocks:
             import numpy as np
@@ -93,13 +167,17 @@ async def run_microphone_listener(
             start = max(0, int(vad.pending_start_ms * config.sample_rate / 1000))
             end = len(samples)
             if end > start:
-                speech_number += 1
                 duration = (end - start) / config.sample_rate
-                task = asyncio.create_task(
-                    transcribe_segment(speech_number, samples[start:end], duration),
-                    name=f"contextshift-speech-{speech_number}",
+                end_ms = int(end * 1000 / config.sample_rate)
+                segment = VadSegment(vad.pending_start_ms, end_ms)
+                utterance_id = tracker.close(segment)
+                transcription_queue.put_nowait(
+                    _TranscriptionJob(
+                        utterance_id=utterance_id,
+                        segment=segment,
+                        samples=samples[start:end],
+                        duration=duration,
+                    )
                 )
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-        if tasks:
-            await asyncio.gather(*tuple(tasks), return_exceptions=True)
+        transcription_queue.put_nowait(None)
+        await worker
