@@ -98,6 +98,9 @@ _ALIASES = (
     ("登录", "鉴权", "认证", "login", "auth", "permission", "jwt"),
     ("数据库", "存储", "database", "storage", "sql", "repository"),
     ("请求", "接口", "request", "api", "endpoint", "route"),
+    ("车辆", "车机", "vehicle", "automobile", "car"),
+    ("信息", "数据", "info", "information", "data"),
+    ("调用", "联动", "链路", "call", "invoke", "client", "service"),
     ("订单", "采购", "order", "purchase", "procurement"),
     ("界面", "窗口", "gui", "window", "desktop", "widget"),
     ("上下文", "历史", "context", "history", "dialogue", "session"),
@@ -375,6 +378,20 @@ def terms(text: str, *, expand: bool = False) -> Counter[str]:
             "not",
             "app",
         }
+    )
+
+
+def code_phrases(text: str) -> frozenset[str]:
+    """Keep module/package literals intact instead of reducing them to words."""
+    return frozenset(
+        value.lower()
+        for value in re.findall(
+            r"(?<![A-Za-z0-9])"
+            r"[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)+"
+            r"(?![A-Za-z0-9])",
+            text,
+        )
+        if len(value) >= 5
     )
 
 
@@ -675,14 +692,19 @@ class RepositoryIndex:
         self._definitions: dict[str, set[str]] = {}
         self._definition_lines: dict[str, set[tuple[str, int]]] = {}
         self._token_chunks: dict[str, list[Chunk]] = {}
+        self._literal_chunks: dict[str, list[Chunk]] = {}
         for path, file in files.items():
             for line, symbol in file.symbols:
                 self._definitions.setdefault(symbol, set()).add(path)
                 self._definition_lines.setdefault(symbol, set()).add((path, line))
             for chunk in file.chunks:
                 for token in chunk.tokens:
-                    if len(token) >= 4:
+                    if len(token) >= 4 or not token.isascii():
                         self._token_chunks.setdefault(token, []).append(chunk)
+                for literal in code_phrases(
+                    f"{chunk.reference.path}\n{chunk.reference.symbol}\n{chunk.text}"
+                ):
+                    self._literal_chunks.setdefault(literal, []).append(chunk)
         self.fingerprint = hashlib.sha256(
             json.dumps(
                 [
@@ -798,6 +820,7 @@ class RepositoryIndex:
         if max_characters < 512:
             raise ValueError("代码上下文预算至少为 512 字符。")
         main = Counter(dict(terms(query[-4000:]).most_common(96)))
+        literals = code_phrases(query[-4000:])
         lower = query[-4000:].lower()
         concepts = [
             group
@@ -849,9 +872,53 @@ class RepositoryIndex:
                         related_paths.update(self._definitions.get(name, ()))
                         for path, line in self._definition_lines.get(name, ()):
                             related_lines.setdefault(path, set()).add(line)
+        candidate_chunks: dict[tuple[str, int], Chunk] = {}
+
+        def add_candidate(chunk: Chunk) -> None:
+            candidate_chunks[(chunk.reference.path, chunk.reference.start_line)] = chunk
+
+        for literal in literals:
+            for chunk in self._literal_chunks.get(literal, ()):
+                add_candidate(chunk)
+        candidate_tokens = main.keys() | recent.keys() | expanded
+        for token in sorted(
+            candidate_tokens,
+            key=lambda value: len(self._token_chunks.get(value, ())),
+        ):
+            postings = self._token_chunks.get(token, ())
+            remaining = 1600 - len(candidate_chunks)
+            if remaining <= 0:
+                break
+            if len(postings) > remaining and candidate_chunks:
+                continue
+            for chunk in postings[:remaining]:
+                add_candidate(chunk)
+        if project_overview:
+            for path, file in self.files.items():
+                basename = PurePosixPath(path).name.lower()
+                if (
+                    basename in _MANIFESTS
+                    or basename.startswith(("readme", "architecture", "design"))
+                    or file.imports
+                ):
+                    for chunk in file.chunks:
+                        add_candidate(chunk)
+        if followup:
+            for path in focus_paths | related_paths | {active_file}:
+                if path in self.files:
+                    for chunk in self.files[path].chunks:
+                        add_candidate(chunk)
+        candidates = tuple(candidate_chunks.values())
         count = max(1, len(self.chunks))
         ranked = []
-        for chunk in self.chunks:
+        relationship_query = bool(
+            re.search(
+                r"调用|联动|接口|链路|\b(call|invoke|endpoint|api)\b",
+                query,
+                re.IGNORECASE,
+            )
+        )
+        for chunk in candidates:
             _cancelled(cancelled)
             score = 0.0
             symbol_tokens = terms(chunk.reference.symbol)
@@ -888,6 +955,40 @@ class RepositoryIndex:
                 score += 5.0 * max(matches, default=0.0)
                 score += 2.0 * max(symbol_matches, default=0.0)
             path = chunk.reference.path
+            path_lower = path.lower()
+            symbol_lower = chunk.reference.symbol.lower()
+            text_lower = chunk.text.lower()
+            literal_score = 0.0
+            for literal in literals:
+                if literal in PurePosixPath(path_lower).parts:
+                    literal_score = max(literal_score, 36.0)
+                elif literal in path_lower:
+                    literal_score = max(literal_score, 28.0)
+                elif literal in symbol_lower:
+                    literal_score = max(literal_score, 26.0)
+                elif literal in text_lower:
+                    literal_score = max(literal_score, 22.0)
+            score += literal_score
+            if relationship_query:
+                if re.search(
+                    r"@(GET|POST|PUT|DELETE|PATCH|RequestMapping|GetMapping|"
+                    r"PostMapping|PutMapping|DeleteMapping)\b",
+                    chunk.text,
+                ):
+                    score += 26.0
+                if re.search(
+                    r"(?:controller|client|service|repository|api)",
+                    symbol_lower,
+                ):
+                    score += 6.0
+                dto_only = bool(
+                    re.search(r"(?:request|response|dto|model)$", symbol_lower)
+                ) and not re.search(
+                    r"@(GET|POST|PUT|DELETE|PATCH|\w*Mapping)\b|\.\w+\s*\(",
+                    chunk.text,
+                )
+                if dto_only:
+                    score *= 0.45
             if chunk.reference.symbol == "模块声明":
                 score *= 0.12
             example = (

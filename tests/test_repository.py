@@ -345,6 +345,74 @@ public interface TaskUploadApiService {
     assert "TspNetManager.getServer" in bundle.text
 
 
+def test_module_literal_and_endpoint_outrank_interceptor_and_dto_across_roots(
+    tmp_path,
+):
+    platform = tmp_path / "nasa-platform"
+    client = tmp_path / "nio_packages_apps_nasa"
+    write(
+        platform,
+        "nasa-app-api/src/VehicleInfoController.java",
+        """@RestController
+@RequestMapping("/vehicle")
+public class VehicleInfoController {
+    @GetMapping("/info")
+    VehicleInfoResponse vehicleInfo() {
+        return vehicleInfoService.queryVehicleInfo();
+    }
+}
+""",
+    )
+    write(
+        platform,
+        "nasa-app-api/src/VehicleInfoService.java",
+        """public class VehicleInfoService {
+    VehicleInfoResponse queryVehicleInfo() { return vehicleGateway.load(); }
+}
+""",
+    )
+    write(
+        platform,
+        "nasa-web-api/src/VehicleInfoRequest.java",
+        "public class VehicleInfoRequest { String vehicleId; }\n",
+    )
+    write(
+        platform,
+        "common/src/OkHttpRetryInterceptor.java",
+        "class OkHttpRetryInterceptor { Response doRequest(Request request) {} }\n",
+    )
+    write(
+        client,
+        "src/NasaAppVehicleRepository.java",
+        """class NasaAppVehicleRepository {
+    private final VehicleApi api = TspNetManager.getServer("nasa-app-api")
+        .create(VehicleApi.class);
+    VehicleInfo loadVehicleInfo() { return api.getVehicleInfo(); }
+}
+""",
+    )
+    write(
+        client,
+        "src/VehicleApi.java",
+        """interface VehicleApi {
+    @GET("vehicle/info") VehicleInfo getVehicleInfo();
+}
+""",
+    )
+    workspace = WorkspaceIndex((index(platform), index(client)))
+
+    bundle = workspace.retrieve(
+        "ok能不能帮我讲一下nasa-app是怎么调用nasa-app-api的数据接口查到车辆信息的"
+    )
+    paths = [reference.path for reference in bundle.references]
+    assert paths[0] == "nasa-app-api/src/VehicleInfoController.java"
+    assert "nasa-app-api/src/VehicleInfoController.java" in paths[:3]
+    assert "nasa-web-api/src/VehicleInfoRequest.java" not in paths[:3]
+    assert "common/src/OkHttpRetryInterceptor.java" not in paths[:3]
+    assert "src/NasaAppVehicleRepository.java" in paths
+    assert "src/VehicleApi.java" in paths
+
+
 def test_project_instructions_are_direct_speech_not_coaching():
     from contextshift.repository import PROJECT_INSTRUCTIONS
 
