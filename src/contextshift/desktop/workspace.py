@@ -6,7 +6,15 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSignalBlocker, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QSettings,
+    QSignalBlocker,
+    QStandardPaths,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QTextCursor, QTextFormat
 from PySide6.QtWidgets import (
     QDialog,
@@ -31,6 +39,7 @@ from contextshift.repository import (
     WorkspaceIndex,
     scan_repository,
 )
+from contextshift.repository_store import RepositoryStore
 
 
 @dataclass(slots=True)
@@ -47,11 +56,12 @@ class IndexJob(QThread):
     result = Signal(int, object, object)
     failed = Signal(int, str)
 
-    def __init__(self, revision, projects, previous, parent=None):
+    def __init__(self, revision, projects, previous, store, parent=None):
         super().__init__(parent)
         self.revision = revision
         self.projects = projects
         self.previous = previous
+        self.store = store
         self.cancelled = threading.Event()
 
     def run(self):
@@ -69,6 +79,7 @@ class IndexJob(QThread):
                     notes,
                     previous=previous,
                     cancelled=self.cancelled,
+                    store=self.store,
                 )
                 inventories[str(root)] = inventory
                 indexes.append(index)
@@ -89,9 +100,23 @@ class WorkspacePanel(QWidget):
     focus_changed = Signal(str)
     idle = Signal()
 
-    def __init__(self, preferences: QSettings, parent=None):
+    def __init__(
+        self,
+        preferences: QSettings,
+        parent=None,
+        *,
+        store: RepositoryStore | None = None,
+    ):
         super().__init__(parent)
         self.preferences = preferences
+        cache_root = Path(
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.CacheLocation
+            )
+        )
+        self.store = store or RepositoryStore(
+            cache_root / "repository-index-v1.sqlite3"
+        )
         self.projects: dict[str, ProjectState] = {}
         self.index: WorkspaceIndex | None = None
         self._previous_index: WorkspaceIndex | None = None
@@ -455,6 +480,7 @@ class WorkspacePanel(QWidget):
             self._revision,
             configs,
             self.index or self._previous_index,
+            self.store,
             self,
         )
         self._jobs.add(job)
@@ -492,6 +518,10 @@ class WorkspacePanel(QWidget):
         message = (
             f"{len(index.files)} / {total_inventory} 文件 · {len(self.projects)} 个项目"
         )
+        parsed = sum(child.parsed_files for child in index.indexes)
+        cached = sum(child.cache_hits for child in index.indexes)
+        if cached and not parsed:
+            message += " · 已复用本地索引"
         if index.skipped or any(
             state.inventory.truncated for state in self.projects.values()
         ):

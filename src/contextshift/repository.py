@@ -11,6 +11,7 @@ import subprocess
 import threading
 from collections import Counter
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -254,7 +255,8 @@ def scan_repository(
     return Inventory(tuple(paths), len(candidates) > MAX_FILES * 4)
 
 
-def _read_source(root: Path, relative: str) -> tuple[str, tuple[int, int, int]]:
+@contextmanager
+def _open_source(root: Path, relative: str):
     """Open every component without following symlinks, including race swaps."""
     if not allowed_path(relative):
         raise ValueError("文件不在允许读取的范围。")
@@ -272,6 +274,24 @@ def _read_source(root: Path, relative: str) -> tuple[str, tuple[int, int, int]]:
             parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
         )
         descriptors.append(descriptor)
+        yield descriptor
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _source_signature(root: Path, relative: str) -> tuple[int, int, int]:
+    """Read cheap metadata through the same no-follow path as source contents."""
+    with _open_source(root, relative) as descriptor:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+            raise ValueError("文件类型或大小不支持。")
+        return info.st_mtime_ns, info.st_size, info.st_ino
+
+
+def _read_source(root: Path, relative: str) -> tuple[str, tuple[int, int, int]]:
+    """Read a source file only after cache metadata says its contents changed."""
+    with _open_source(root, relative) as descriptor:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_FILE_BYTES:
             raise ValueError("文件类型或大小不支持。")
@@ -291,9 +311,6 @@ def _read_source(root: Path, relative: str) -> tuple[str, tuple[int, int, int]]:
             after.st_size,
             after.st_ino,
         )
-    finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
 
 
 def terms(text: str, *, expand: bool = False) -> Counter[str]:
@@ -637,12 +654,16 @@ class RepositoryIndex:
         notes: str,
         files: dict[str, SourceFile],
         skipped: tuple[str, ...] = (),
+        cache_hits: int = 0,
+        parsed_files: int = 0,
     ):
         self.root = root
         self.selection = selection
         self.notes = notes
         self.files = MappingProxyType(files)
         self.skipped = skipped
+        self.cache_hits = cache_hits
+        self.parsed_files = parsed_files
         self.chunks = tuple(chunk for f in files.values() for chunk in f.chunks)
         self._frequencies = Counter(t for c in self.chunks for t in c.tokens)
         self._definitions: dict[str, set[str]] = {}
@@ -679,6 +700,7 @@ class RepositoryIndex:
         *,
         previous: "RepositoryIndex | None" = None,
         cancelled: threading.Event | None = None,
+        store=None,
     ) -> "RepositoryIndex":
         root = root.absolute()
         if root.resolve(strict=True) != root:
@@ -686,11 +708,29 @@ class RepositoryIndex:
         files = {}
         skipped = []
         total = 0
-        for relative in inventory.paths:
+        selected_paths = tuple(
+            relative for relative in inventory.paths if in_scope(relative, selection)
+        )
+        stored = store.load(root, selected_paths) if store and previous is None else {}
+        cache_hits = 0
+        parsed_files = 0
+        for relative in selected_paths:
             _cancelled(cancelled)
-            if not in_scope(relative, selection):
-                continue
             try:
+                signature = _source_signature(root, relative)
+                old = (
+                    previous.files.get(relative)
+                    if previous and previous.root == root
+                    else stored.get(relative)
+                )
+                if old and old.signature == signature:
+                    total += len(old.text.encode())
+                    if total > MAX_TOTAL_BYTES:
+                        skipped.append(f"{relative}：超过总索引大小限制")
+                        continue
+                    files[relative] = old
+                    cache_hits += 1
+                    continue
                 # Re-open safely even on refresh: never reuse a cache through a
                 # newly replaced parent symlink or a changed ignore policy.
                 text, signature = _read_source(root, relative)
@@ -698,19 +738,22 @@ class RepositoryIndex:
                 if total > MAX_TOTAL_BYTES:
                     skipped.append(f"{relative}：超过总索引大小限制")
                     continue
-                old = (
-                    previous.files.get(relative)
-                    if previous and previous.root == root
-                    else None
-                )
-                files[relative] = (
-                    old
-                    if old and old.signature == signature and old.text == text
-                    else _source_file(relative, text, signature)
-                )
+                files[relative] = _source_file(relative, text, signature)
+                parsed_files += 1
             except (OSError, ValueError, UnicodeError) as exc:
                 skipped.append(f"{relative}：{type(exc).__name__}")
-        return cls(root, selection, notes[:6000], files, tuple(skipped))
+        _cancelled(cancelled)
+        if store is not None:
+            store.sync(root, files, cancelled)
+        return cls(
+            root,
+            selection,
+            notes[:6000],
+            files,
+            tuple(skipped),
+            cache_hits,
+            parsed_files,
+        )
 
     def retrieve(
         self,

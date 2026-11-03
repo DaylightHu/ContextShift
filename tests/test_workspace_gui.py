@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from contextshift.desktop import workspace as module
 from contextshift.desktop.workspace import WorkspacePanel
+from contextshift.repository_store import RepositoryStore
 
 
 def wait(app, predicate):
@@ -32,7 +33,9 @@ def wait(app, predicate):
 def panel(tmp_path):
     app = QApplication.instance() or QApplication([])
     prefs = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    view = WorkspacePanel(prefs)
+    view = WorkspacePanel(
+        prefs, store=RepositoryStore(tmp_path / "repository-index.sqlite3")
+    )
     yield app, view
     view.shutdown()
     wait(app, lambda: not view._jobs)
