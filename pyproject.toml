@@ -16,6 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+desktop = ["PySide6-Essentials>=6.8"]
+bundle = ["pyinstaller>=6.12"]
 speech = [
     "funasr>=1.2.7",
     "numpy>=2.2.0",
@@ -26,6 +28,7 @@ speech = [
 
 [project.scripts]
 contextshift = "contextshift.cli:app"
+contextshift-gui = "contextshift.desktop.app:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
