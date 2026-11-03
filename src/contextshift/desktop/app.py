@@ -1,4 +1,4 @@
-"""Launch a voice-only chat after its speech and cloud paths are ready."""
+"""Launch a desktop session after the selected input path is ready."""
 
 import sys
 from pathlib import Path
@@ -12,7 +12,7 @@ def main() -> None:
         from contextshift.desktop.window import MainWindow
     except ImportError as exc:
         raise SystemExit(
-            "缺少桌面依赖，请运行：uv sync --extra desktop --extra speech"
+            "缺少桌面依赖，请运行：uv sync --extra desktop；语音模式另加 --extra speech"
         ) from exc
     application = QApplication(sys.argv)
     application.setApplicationName("ContextShift")

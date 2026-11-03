@@ -49,7 +49,7 @@ def main() -> None:
     parser.add_argument(
         "--without-speech",
         action="store_true",
-        help="仅用于界面打包检查，不包含语音依赖",
+        help="仅打包文字测试模式，不包含语音依赖",
     )
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
