@@ -1,6 +1,7 @@
 """Independent local capture -> FSMN-VAD -> SenseVoice channels."""
 
 import asyncio
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from inspect import isawaitable
@@ -21,6 +22,54 @@ from contextshift.speech.vad import FsmnVad, VadSegment
 
 SpeechStartedHandler = Callable[[SpeechStarted], None]
 TranscriptHandler = Callable[[TranscriptReady], Awaitable[None] | None]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedChannel:
+    config: AudioConfig
+    vad: FsmnVad
+    transcriber: SenseVoiceTranscriber
+
+
+def prepare_channels(
+    *,
+    asr_model_dir: str | Path,
+    vad_model_dir: str | Path,
+    microphone_config: AudioConfig,
+    system_config: AudioConfig,
+    asr_device: str = "cpu",
+    cancelled: threading.Event | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict[AudioSource, PreparedChannel]:
+    """Prepare independent models without opening audio or emitting speech."""
+
+    result = {}
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled.is_set():
+            raise InterruptedError("启动已取消。")
+
+    for source, config in (
+        ("microphone", microphone_config),
+        ("system", system_config),
+    ):
+        check_cancelled()
+        if on_progress is not None:
+            on_progress(
+                "正在预热麦克风模型…"
+                if source == "microphone"
+                else "正在预热会议音频模型…"
+            )
+        vad = FsmnVad(
+            vad_model_dir, sample_rate=config.sample_rate, chunk_ms=config.block_ms
+        )
+        transcriber = SenseVoiceTranscriber(asr_model_dir, device=asr_device)
+        vad.warm_up()
+        check_cancelled()
+        transcriber.warm_up()
+        check_cancelled()
+        result[source] = PreparedChannel(config, vad, transcriber)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,15 +169,22 @@ async def run_audio_listener(
     asr_device: str = "cpu",
     on_speech_started: SpeechStartedHandler | None = None,
     on_transcript: TranscriptHandler | None = None,
+    prepared: PreparedChannel | None = None,
+    on_ready: Callable[[], None] | None = None,
 ) -> None:
     """Capture until cancelled and transcribe closed VAD segments in order."""
 
     role_for_source(source)
     config = audio_config or AudioConfig()
-    vad = FsmnVad(
-        vad_model_dir, sample_rate=config.sample_rate, chunk_ms=config.block_ms
-    )
-    transcriber = SenseVoiceTranscriber(asr_model_dir, device=asr_device)
+    if prepared is not None:
+        if prepared.config != config:
+            raise SpeechConfigurationError("预热模型与音频设备配置不一致。")
+        vad, transcriber = prepared.vad, prepared.transcriber
+    else:
+        vad = FsmnVad(
+            vad_model_dir, sample_rate=config.sample_rate, chunk_ms=config.block_ms
+        )
+        transcriber = SenseVoiceTranscriber(asr_model_dir, device=asr_device)
     blocks: list[Any] = []
     tracker = _SpeechEventTracker(on_speech_started, source)
     transcription_queue: asyncio.Queue[_TranscriptionJob | None] = asyncio.Queue()
@@ -165,6 +221,8 @@ async def run_audio_listener(
     print(f"开始监听 {source}，按 Ctrl-C 停止。", flush=True)
     try:
         with MicrophoneStream(config) as microphone:
+            if on_ready is not None:
+                on_ready()
             while True:
                 if worker.done():
                     await worker  # Surface ASR failures instead of capturing forever.
@@ -216,6 +274,8 @@ async def run_dual_audio_listener(
     asr_device: str = "cpu",
     on_speech_started: SpeechStartedHandler | None = None,
     on_transcript: TranscriptHandler | None = None,
+    prepared_channels: dict[AudioSource, PreparedChannel] | None = None,
+    on_ready: Callable[[], None] | None = None,
 ) -> None:
     """Run isolated VAD/ASR queues for mic and an explicit loopback input.
 
@@ -240,6 +300,20 @@ async def run_dual_audio_listener(
             )
     # Validate both configs before either task opens a capture stream.
     _ = microphone_config.block_size, system_config.block_size
+    if prepared_channels is not None and set(prepared_channels) != {
+        "microphone",
+        "system",
+    }:
+        raise SpeechConfigurationError("两路模型尚未全部预热。")
+    opened: set[AudioSource] = set()
+
+    def channel_opened(source: AudioSource) -> None:
+        if source in opened:
+            return
+        opened.add(source)
+        if len(opened) == 2 and on_ready is not None:
+            on_ready()
+
     tasks = [
         asyncio.create_task(
             run_audio_listener(
@@ -250,6 +324,16 @@ async def run_dual_audio_listener(
                 asr_device=asr_device,
                 on_speech_started=on_speech_started,
                 on_transcript=on_transcript,
+                **(
+                    {"prepared": prepared_channels[source]}
+                    if prepared_channels is not None
+                    else {}
+                ),
+                **(
+                    {"on_ready": lambda source=source: channel_opened(source)}
+                    if on_ready is not None
+                    else {}
+                ),
             ),
             name=f"contextshift-{source}-listener",
         )

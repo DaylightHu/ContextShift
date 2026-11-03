@@ -1,4 +1,4 @@
-"""The desktop thread owns one asyncio session and optional local audio."""
+"""Prepare the entire speech path before announcing a usable desktop session."""
 
 import asyncio
 import re
@@ -15,17 +15,16 @@ from contextshift.llm import DeepSeekProvider
 from contextshift.session import Session, TurnResult
 from contextshift.speech.audio import AudioConfig
 from contextshift.speech.events import SpeechStarted, TranscriptReady
-from contextshift.speech.listen import run_dual_audio_listener
+from contextshift.speech.listen import prepare_channels, run_dual_audio_listener
 
 
 @dataclass(frozen=True, slots=True)
 class DesktopOptions:
     settings: Settings
-    audio_enabled: bool
-    microphone: int | None = None
-    system: int | None = None
-    asr_model: Path = Path("models/asr/SenseVoiceSmall")
-    vad_model: Path = Path("models/vad/fsmn-vad")
+    microphone: int
+    system: int
+    asr_model: Path
+    vad_model: Path
 
 
 def safe_error(exc: BaseException) -> str:
@@ -46,75 +45,77 @@ class AssistantWorker(QThread):
         self.options = options
         self._loop: asyncio.AbstractEventLoop | None = None
         self._assistant: LiveAssistant | None = None
+        self._initialization: asyncio.Task | None = None
         self._stop: asyncio.Event | None = None
         self._stop_requested = threading.Event()
         self._epoch = 0
+        self._announced_ready = False
 
     def request_stop(self) -> None:
         self._stop_requested.set()
-        self._dispatch(self._stop_on_loop)
-
-    def _dispatch(self, callback, *args) -> None:
         loop = self._loop
         if loop is not None and not loop.is_closed():
             try:
-                loop.call_soon_threadsafe(callback, *args)
+                loop.call_soon_threadsafe(self._stop_on_loop)
             except RuntimeError:
                 pass
 
     def _stop_on_loop(self) -> None:
         if self._assistant is not None:
             self._assistant.cancel_current()
+        if self._initialization is not None:
+            self._initialization.cancel()
         if self._stop is not None:
             self._stop.set()
 
-    def ask(self, text: str) -> None:
-        if not self._stop_requested.is_set():
-            self._dispatch(self._ask_on_loop, text)
-
-    def _ask_on_loop(self, text: str) -> None:
-        if self._assistant is None or self._stop_requested.is_set():
-            return
-        self._new_response()
-        self.transcript.emit("手动输入", text, True)
-        self.status.emit("正在生成提示")
-        self._assistant.handle_manual_question(text)
-
-    def cancel_answer(self) -> None:
-        self._dispatch(self._cancel_on_loop)
-
-    def _cancel_on_loop(self) -> None:
-        if self._assistant is not None:
-            self._assistant.cancel_current()
-            self.status.emit("已取消 · 等待下一句")
-
-    def _new_response(self) -> None:
-        self._epoch += 1
-        self.response_started.emit(self._epoch)
+    def _audio_ready(self) -> None:
+        if not self._stop_requested.is_set() and not self._announced_ready:
+            self._announced_ready = True
+            self.status.emit("正在监听")
+            self.ready.emit()
 
     def run(self) -> None:
         try:
             asyncio.run(self._run())
-        except Exception as exc:  # noqa: BLE001 - keep GUI open on device/API errors
-            self.failed.emit(safe_error(exc))
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - keep Qt alive on runtime errors
+            if not self._stop_requested.is_set():
+                self.failed.emit(safe_error(exc))
         finally:
             self._loop = None
             self._assistant = None
+
+    async def _prepare(self, provider: DeepSeekProvider):
+        self.status.emit("正在检查云端连接…")
+        await provider.prepare()
+        if self._stop_requested.is_set():
+            raise asyncio.CancelledError
+        options = self.options
+        return await asyncio.to_thread(
+            prepare_channels,
+            asr_model_dir=options.asr_model,
+            vad_model_dir=options.vad_model,
+            microphone_config=AudioConfig(device=options.microphone),
+            system_config=AudioConfig(device=options.system),
+            cancelled=self._stop_requested,
+            on_progress=self.status.emit,
+        )
 
     async def _run(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop = asyncio.Event()
         options = self.options
-        session = Session(DeepSeekProvider(options.settings))
+        provider = DeepSeekProvider(options.settings)
+        session = Session(provider)
 
         def failed(exc: BaseException) -> None:
-            self.failed.emit(safe_error(exc))
             self.response_finished.emit(self._epoch, "失败")
-            self.status.emit("本次分析失败，可以重试")
+            self.failed.emit(safe_error(exc))
+            self._stop.set()
 
         def finished(result: TurnResult) -> None:
             self.response_finished.emit(self._epoch, "已完成")
-            self.status.emit("正在监听" if options.audio_enabled else "就绪 · 文字模式")
 
         self._assistant = LiveAssistant(
             session,
@@ -128,55 +129,60 @@ class AssistantWorker(QThread):
         )
 
         def started(event: SpeechStarted) -> None:
+            if self._stop_requested.is_set():
+                return
             self._assistant.handle_speech_started(event)
             if event.source == "system":
-                self._new_response()
-                self.status.emit("正在听对方讲话")
+                self._epoch += 1
+                self.response_started.emit(self._epoch)
 
         def transcript(event: TranscriptReady) -> None:
-            current_question = (
+            if self._stop_requested.is_set():
+                return
+            current = (
                 event.source == "system"
                 and event.utterance_id == self._assistant.latest_utterance_id
             )
             self.transcript.emit(
-                "候选人" if event.role == "candidate" else "面试官",
-                event.text,
-                current_question,
+                "候选人" if event.role == "candidate" else "面试官", event.text, current
             )
             self._assistant.handle_transcript(event)
-            if current_question and event.text.strip():
-                self.status.emit("正在生成提示")
 
-        audio: asyncio.Task[None] | None = None
+        audio: asyncio.Task | None = None
         try:
             if self._stop_requested.is_set():
                 return
-            if options.audio_enabled:
-                if options.microphone is None or options.system is None:
-                    raise ValueError("请选择麦克风与会议回环输入设备。")
-                audio = asyncio.create_task(
-                    run_dual_audio_listener(
-                        asr_model_dir=options.asr_model,
-                        vad_model_dir=options.vad_model,
-                        microphone_config=AudioConfig(device=options.microphone),
-                        system_config=AudioConfig(device=options.system),
-                        on_speech_started=started,
-                        on_transcript=transcript,
-                    )
+            self._initialization = asyncio.create_task(self._prepare(provider))
+            try:
+                prepared = await self._initialization
+            finally:
+                self._initialization = None
+            if self._stop_requested.is_set():
+                return
+            self.status.emit("正在打开音频输入…")
+            audio = asyncio.create_task(
+                run_dual_audio_listener(
+                    asr_model_dir=options.asr_model,
+                    vad_model_dir=options.vad_model,
+                    microphone_config=AudioConfig(device=options.microphone),
+                    system_config=AudioConfig(device=options.system),
+                    prepared_channels=prepared,
+                    on_ready=self._audio_ready,
+                    on_speech_started=started,
+                    on_transcript=transcript,
                 )
-
-                def audio_finished(task: asyncio.Task[None]) -> None:
-                    if not task.cancelled() and not self._stop_requested.is_set():
-                        exc = task.exception()
-                        if exc is not None:
-                            failed(exc)
-                        self._stop.set()
-
-                audio.add_done_callback(audio_finished)
-            self.ready.emit()
-            self.status.emit(
-                "正在准备音频" if options.audio_enabled else "就绪 · 文字模式"
             )
+
+            def audio_finished(task: asyncio.Task) -> None:
+                if not task.cancelled() and not self._stop_requested.is_set():
+                    exc = task.exception()
+                    if exc is not None:
+                        failed(exc)
+                    elif not self._announced_ready:
+                        failed(RuntimeError("音频输入在就绪前退出。"))
+                    self._stop.set()
+
+            audio.add_done_callback(audio_finished)
             await self._stop.wait()
         finally:
             self._assistant.cancel_current()

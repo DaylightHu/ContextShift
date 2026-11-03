@@ -97,7 +97,12 @@ class MicrophoneStream:
             device=self.config.device,
             callback=callback,
         )
-        self._stream.start()
+        try:
+            self._stream.start()
+        except BaseException:
+            self._stream.close()
+            self._stream = None
+            raise
         return self
 
     def __exit__(
@@ -108,9 +113,11 @@ class MicrophoneStream:
     ) -> None:
         del exc_type, exc, traceback
         if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+            stream, self._stream = self._stream, None
+            try:
+                stream.stop()
+            finally:
+                stream.close()
 
     def next_block(self, timeout: float = 1.0) -> Any:
         """Block until the next float32 mono audio block is available."""

@@ -1,4 +1,4 @@
-"""A small native control panel for live audio and cited repository questions."""
+"""Launch a voice-only chat after its speech and cloud paths are ready."""
 
 import sys
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 
 def main() -> None:
     try:
+        from PySide6.QtCore import QTimer
         from PySide6.QtWidgets import QApplication
 
         from contextshift.desktop.window import MainWindow
@@ -16,8 +17,9 @@ def main() -> None:
     application = QApplication(sys.argv)
     application.setApplicationName("ContextShift")
     application.setOrganizationName("ContextShift")
-    window = MainWindow()
-    window.show()
+    application.setQuitOnLastWindowClosed(False)
+    window = MainWindow(manage_application=True)
+    QTimer.singleShot(0, window.launch)
     # Keep the window alive while Qt's event loop runs.
     application._contextshift_window = window
     raise SystemExit(application.exec())

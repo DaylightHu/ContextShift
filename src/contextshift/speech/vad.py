@@ -128,3 +128,15 @@ class FsmnVad:
 
         self._cache = {}
         self._pending_start_ms = None
+
+    def warm_up(self) -> None:
+        """Prime inference, then discard synthetic boundaries and stream cache."""
+
+        import numpy as np
+
+        try:
+            self.accept(
+                np.zeros(self.sample_rate * self.chunk_ms // 1000, dtype="float32")
+            )
+        finally:
+            self.reset()

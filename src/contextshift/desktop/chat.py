@@ -10,15 +10,11 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Literal
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTime, QTimer, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPainterPath, QPen, QTextOption
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QTextOption
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
-    QLabel,
-    QPlainTextEdit,
-    QPushButton,
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
@@ -185,23 +181,7 @@ class ChatMessage(QWidget):
         column = QVBoxLayout(self.bubble)
         column.setContentsMargins(17, 12, 17, 14)
         column.setSpacing(7)
-        header = QHBoxLayout()
-        name = QLabel(title or ROLES[role].title)
-        name.setStyleSheet(f"color: {ROLES[role].accent}; font-weight: 600;")
-        header.addWidget(name)
-        self.state_label = QLabel(state)
-        self.state_label.setObjectName("muted")
-        header.addWidget(self.state_label)
-        header.addStretch()
-        time = QLabel(QTime.currentTime().toString("HH:mm"))
-        time.setObjectName("timestamp")
-        header.addWidget(time)
-        copy = QPushButton("复制")
-        copy.setObjectName("copy")
-        copy.setCursor(Qt.CursorShape.PointingHandCursor)
-        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.text))
-        header.addWidget(copy)
-        column.addLayout(header)
+        self.setAccessibleName(title or ROLES[role].title)
         self.body = MessageText()
         column.addWidget(self.body)
         row.addWidget(self.bubble, 1)
@@ -214,7 +194,7 @@ class ChatMessage(QWidget):
 
     def set_text(self, text: str) -> None:
         self.text = text
-        self.body.setText(text if text else "正在整理提示…")
+        self.body.setText(text if text else "•••")
         self.body.setStyleSheet("color: #a6adc8;" if not text else "")
         self.body.updateGeometry()
         self.updateGeometry()
@@ -226,7 +206,7 @@ class ChatMessage(QWidget):
 
     def set_state(self, state: str) -> None:
         self.state = state
-        self.state_label.setText(state)
+        self.setToolTip(state)
         self.changed.emit()
 
 
@@ -257,31 +237,11 @@ class ChatFeed(QScrollArea):
 
     def _welcome(self) -> QWidget:
         welcome = QWidget()
-        welcome.setMinimumHeight(320)
+        welcome.setMinimumHeight(180)
         column = QVBoxLayout(welcome)
         column.setSpacing(17)
         column.addStretch()
-        mark = QLabel("›_")
-        mark.setObjectName("welcomeMark")
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(mark)
-        title = QLabel("让思路，跟上对话。")
-        title.setObjectName("welcomeTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(title)
-        subtitle = QLabel("真实发言留在上下文，下一句提示随时就位。")
-        subtitle.setObjectName("muted")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        column.addWidget(subtitle)
-        legend = QHBoxLayout()
-        legend.addStretch()
-        for role in ("microphone", "computer", "ai"):
-            legend.addWidget(Avatar(role))
-            label = QLabel(ROLES[role].title)
-            label.setStyleSheet(f"color: {ROLES[role].accent}; padding-right: 18px;")
-            legend.addWidget(label)
-        legend.addStretch()
-        column.addLayout(legend)
+        column.addWidget(Avatar("ai"), 0, Qt.AlignmentFlag.AlignHCenter)
         column.addStretch()
         return welcome
 
@@ -312,6 +272,13 @@ class ChatFeed(QScrollArea):
         scrollbar = self.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def remove_message(self, message: ChatMessage) -> None:
+        if message in self.messages:
+            self.messages.remove(message)
+            self.column.removeWidget(message)
+            message.deleteLater()
+            self.scroll_to_latest()
+
     def clear(self) -> None:
         for message in self.messages:
             self.column.removeWidget(message)
@@ -319,22 +286,3 @@ class ChatFeed(QScrollArea):
         self.messages.clear()
         self.welcome.show()
         self.scroll_to_latest()
-
-
-class Composer(QPlainTextEdit):
-    submitted = Signal()
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("composer")
-        self.setFixedHeight(80)
-        self.setPlaceholderText("输入一个问题，或等待对方讲话…")
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter} and not (
-            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-        ):
-            self.submitted.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
