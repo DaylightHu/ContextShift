@@ -73,3 +73,10 @@ class SenseVoiceTranscriber:
         except ImportError:
             return text.strip()
         return rich_transcription_postprocess(text).strip()
+
+    def warm_up(self) -> None:
+        """Load weights and run one discarded local inference before capture."""
+
+        import numpy as np
+
+        self.transcribe(np.zeros(16_000, dtype="float32"))

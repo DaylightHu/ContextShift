@@ -20,11 +20,14 @@ class LiveAssistant:
         *,
         history: DialogueHistory | None = None,
         on_error: TurnErrorHandler | None = None,
+        on_turn_finished: Callable[[TurnResult], None] | None = None,
     ) -> None:
         self._session = session
         self._on_delta = on_delta
         self._history = history if history is not None else DialogueHistory()
         self._on_error = on_error
+        self._on_turn_finished = on_turn_finished
+        self._active_turn_id: int | None = None
         self._latest_ids: dict[AudioSource, int] = {}
         self._transcribed_ids: dict[AudioSource, int] = {}
         self._speaking: set[AudioSource] = set()
@@ -58,7 +61,7 @@ class LiveAssistant:
         self._latest_ids[event.source] = event.utterance_id
         self._speaking.add(event.source)
         if event.source == "system":
-            self._session.cancel()
+            self.cancel_current()
 
     def handle_transcript(self, event: TranscriptReady) -> None:
         """Consume source-ordered final transcripts and answer system audio."""
@@ -91,7 +94,26 @@ class LiveAssistant:
         if model_input is None or event.utterance_id != self._latest_ids.get("system"):
             return
 
-        _, task = self._session.submit(model_input, self._on_delta)
+        self._submit(model_input)
+
+    def handle_manual_question(self, text: str) -> None:
+        """Record UI input as user text, independently of spoken audio roles."""
+
+        text = text.strip()
+        if self._closed or not text:
+            return
+        self.cancel_current()
+        model_input = self._history.build_model_input(text)
+        self._history.append(text, role="user")
+        self._submit(model_input)
+
+    def cancel_current(self) -> None:
+        self._active_turn_id = None
+        self._session.cancel()
+
+    def _submit(self, model_input: str) -> None:
+        turn_id, task = self._session.submit(model_input, self._on_delta)
+        self._active_turn_id = turn_id
         self._tasks.add(task)
         task.add_done_callback(self._turn_finished)
 
@@ -102,7 +124,7 @@ class LiveAssistant:
             return
 
         self._closed = True
-        self._session.cancel()
+        self.cancel_current()
         if self._tasks:
             await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
 
@@ -111,7 +133,13 @@ class LiveAssistant:
         if task.cancelled():
             return
         try:
-            task.result()
+            result = task.result()
+            if (
+                not self._closed
+                and self._on_turn_finished is not None
+                and result.turn_id == self._active_turn_id
+            ):
+                self._on_turn_finished(result)
         except Exception as exc:  # noqa: BLE001 - surface provider failures
             if self._on_error is not None:
                 self._on_error(exc)

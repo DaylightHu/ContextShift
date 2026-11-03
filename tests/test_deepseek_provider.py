@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -101,3 +102,38 @@ async def test_rejects_requests_after_close() -> None:
 
     with pytest.raises(RuntimeError, match="DeepSeekProvider is closed"):
         await anext(provider.stream(request))
+
+
+@pytest.mark.asyncio
+async def test_prepare_checks_model_on_same_client_without_generating_text() -> None:
+    settings = Settings(DEEPSEEK_API_KEY="test-key")
+    client = FakeClient()
+    calls = []
+
+    async def list_models(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(data=[SimpleNamespace(id=settings.model)])
+
+    client.models = SimpleNamespace(list=list_models)
+    provider = DeepSeekProvider(settings, client=cast(AsyncOpenAI, client))
+    await provider.prepare()
+    assert calls == [{"timeout": 10}]
+    assert not client.responses.calls
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_unknown_model_before_audio_start() -> None:
+    client = FakeClient()
+
+    async def list_models(**kwargs):
+        return SimpleNamespace(data=[])
+
+    client.models = SimpleNamespace(list=list_models)
+    provider = DeepSeekProvider(
+        Settings(DEEPSEEK_API_KEY="test-key"), client=cast(AsyncOpenAI, client)
+    )
+    with pytest.raises(ValueError, match="所选模型"):
+        await provider.prepare()
+    assert not client.responses.calls
+    await provider.close()

@@ -24,6 +24,15 @@ class DeepSeekProvider:
         )
         self._closed = False
 
+    async def prepare(self) -> None:
+        """Check authentication/model availability and warm the HTTP connection."""
+
+        if self._closed:
+            raise RuntimeError("DeepSeekProvider is closed")
+        models = await self._client.models.list(timeout=10)
+        if self._settings.model not in {model.id for model in models.data}:
+            raise ValueError(f"云端未提供所选模型：{self._settings.model}")
+
     async def stream(self, request: ModelRequest) -> AsyncGenerator[str, None]:
         """Yield only text deltas and always close the response stream."""
 
