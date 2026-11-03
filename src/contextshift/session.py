@@ -1,7 +1,7 @@
 """Streaming session orchestration with turn-aware output filtering."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -50,6 +50,8 @@ class Session:
         instructions: str = DEFAULT_INSTRUCTIONS,
         turn_controller: TurnController | None = None,
         response_limits: ResponseLimits | None = None,
+        context_resolver: Callable[[ModelRequest], Awaitable[ModelRequest]]
+        | None = None,
     ) -> None:
         self._provider = provider
         self._instructions = instructions
@@ -57,11 +59,14 @@ class Session:
         self._response_limits = response_limits or ResponseLimits()
         self._tasks: set[asyncio.Task[TurnResult]] = set()
         self._closed = False
+        self._context_resolver = context_resolver
 
     def submit(
         self,
         question: str,
         on_delta: DeltaHandler,
+        *,
+        query: str = "",
     ) -> tuple[int, asyncio.Task[TurnResult]]:
         """Start a turn, cancelling and invalidating the previous turn."""
 
@@ -71,13 +76,22 @@ class Session:
         request = ModelRequest(
             input=question,
             instructions=self._instructions,
+            query=query or question,
         )
 
         async def run(turn_id: int) -> TurnResult:
             limiter = ResponseLimiter(self._response_limits)
-            stream = self._provider.stream(request)
+            stream = None
 
             try:
+                resolved = (
+                    await self._context_resolver(request)
+                    if self._context_resolver is not None
+                    else request
+                )
+                if not self._turn_controller.is_current(turn_id):
+                    return TurnResult(turn_id, "interrupted", 0)
+                stream = self._provider.stream(resolved)
                 async for text in stream:
                     if not self._turn_controller.is_current(turn_id):
                         return TurnResult(
@@ -107,7 +121,8 @@ class Session:
                     output_characters=limiter.characters,
                 )
             finally:
-                await stream.aclose()
+                if stream is not None:
+                    await stream.aclose()
 
         turn_id, task = self._turn_controller.start(run)
         self._tasks.add(task)

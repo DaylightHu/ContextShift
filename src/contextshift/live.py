@@ -94,7 +94,7 @@ class LiveAssistant:
         if model_input is None or event.utterance_id != self._latest_ids.get("system"):
             return
 
-        self._submit(model_input)
+        self._submit(model_input, query=text)
 
     def handle_manual_question(self, text: str) -> None:
         """Record UI input as user text, independently of spoken audio roles."""
@@ -105,14 +105,14 @@ class LiveAssistant:
         self.cancel_current()
         model_input = self._history.build_model_input(text)
         self._history.append(text, role="user")
-        self._submit(model_input)
+        self._submit(model_input, query=text)
 
     def cancel_current(self) -> None:
         self._active_turn_id = None
         self._session.cancel()
 
-    def _submit(self, model_input: str) -> None:
-        turn_id, task = self._session.submit(model_input, self._on_delta)
+    def _submit(self, model_input: str, *, query: str) -> None:
+        turn_id, task = self._session.submit(model_input, self._on_delta, query=query)
         self._active_turn_id = turn_id
         self._tasks.add(task)
         task.add_done_callback(

@@ -52,6 +52,39 @@ class LimitAwareProvider:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_context_resolution_cannot_start_a_stale_provider_request():
+    entered = asyncio.Event()
+    sent = []
+
+    class Provider:
+        async def stream(self, request):
+            sent.append(request)
+            yield request.input
+
+        async def close(self):
+            pass
+
+    async def resolve(request):
+        if request.query == "A":
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return ModelRequest("stale code", request.instructions)
+        return ModelRequest("B with current code", request.instructions)
+
+    session = Session(Provider(), context_resolver=resolve)
+    rendered = []
+    _, first = session.submit("first", rendered.append, query="A")
+    await asyncio.wait_for(entered.wait(), 1)
+    _, second = session.submit("second", rendered.append, query="B")
+    await asyncio.gather(first, second)
+    assert [request.input for request in sent] == ["B with current code"]
+    assert [delta.text for delta in rendered] == ["B with current code"]
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_new_turn_never_renders_stale_deltas() -> None:
     provider = InterruptResistantProvider()
     session = Session(provider)

@@ -270,7 +270,9 @@ async def test_capture_to_transcript_keeps_channels_isolated(monkeypatch) -> Non
 
         def next_block(self):
             try:
-                return self.blocks.get(timeout=0.01)
+                # Match the real capture timeout so a scheduled ASR task can
+                # finish before this one-block fixture reports input loss.
+                return self.blocks.get(timeout=1.0)
             except queue.Empty as exc:
                 raise TimeoutError from exc
 

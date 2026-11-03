@@ -14,6 +14,12 @@ from contextshift.config import Settings
 from contextshift.dialogue import DialogueHistory
 from contextshift.live import LiveAssistant
 from contextshift.llm import DeepSeekProvider
+from contextshift.llm.base import ModelRequest
+from contextshift.repository import (
+    PROJECT_INSTRUCTIONS,
+    RepositoryIndex,
+    SourceReference,
+)
 from contextshift.session import Session, TurnDelta, TurnResult
 from contextshift.speech.audio import AudioConfig
 from contextshift.speech.events import (
@@ -41,6 +47,8 @@ class ReplyMetrics:
     elapsed_seconds: float
     finish_reason: str
     output_characters: int
+    retrieval_seconds: float = 0.0
+    source_count: int = 0
 
 
 def safe_error(exc: BaseException) -> str:
@@ -57,6 +65,7 @@ class AssistantWorker(QThread):
     failed = Signal(str)
     request_failed = Signal(int, str)
     metrics = Signal(int, object)
+    sources = Signal(int, object, float)
 
     def __init__(self, options: DesktopOptions, parent=None) -> None:
         super().__init__(parent)
@@ -70,6 +79,107 @@ class AssistantWorker(QThread):
         self._announced_ready = False
         self._accepting_text = threading.Event()
         self._text_handler: Callable[[str, SpeakerRole], None] | None = None
+        self._repository: RepositoryIndex | None = None
+        self._repository_revision = 0
+        self._code_focus: tuple[SourceReference, ...] = ()
+        self._active_file = ""
+        self._repository_pending = False
+        self._repository_root: Path | None = None
+        self._retrieval_metrics: tuple[int, float, int] = (-1, 0.0, 0)
+        self._turn_sources: tuple[SourceReference, ...] = ()
+        self._reply_text = ""
+
+    def set_repository(
+        self,
+        index: RepositoryIndex | None,
+        *,
+        pending: bool = False,
+        root: Path | None = None,
+    ) -> None:
+        """Change code scope without resetting actual conversation history."""
+
+        def apply() -> None:
+            new_root = index.root if index is not None else root
+            self._repository = index
+            self._repository_pending = pending
+            self._repository_revision += 1
+            if new_root is None or new_root != self._repository_root:
+                self._code_focus = ()
+                self._active_file = ""
+            elif index is not None:
+                self._code_focus = tuple(
+                    r
+                    for r in self._code_focus
+                    if r.path in index.files and index.files[r.path].digest == r.digest
+                )
+            self._repository_root = new_root
+            if self._assistant is not None:
+                self._assistant.cancel_current()
+                self.response_finished.emit(self._epoch, "上下文已更新")
+
+        self._on_loop(apply)
+
+    def set_active_file(self, relative: str) -> None:
+        self._on_loop(lambda: setattr(self, "_active_file", relative))
+
+    def _on_loop(self, function: Callable[[], None]) -> None:
+        loop = self._loop
+        if loop is None:
+            function()
+        elif not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(function)
+            except RuntimeError:
+                pass
+
+    async def _resolve_context(self, request: ModelRequest) -> ModelRequest:
+        index = self._repository
+        revision, epoch = self._repository_revision, self._epoch
+        if index is None:
+            if self._repository_pending:
+                return ModelRequest(
+                    request.input
+                    + "\n\n项目索引正在更新或不可用，本轮没有代码证据。涉及项目实现时明确说明暂时无法定位，不得猜测。",
+                    request.instructions + PROJECT_INSTRUCTIONS,
+                    request.query,
+                )
+            return request
+        dialogue = (
+            tuple(turn.text for turn in self._assistant.history.turns[-5:])
+            if self._assistant
+            else ()
+        )
+        cancelled = threading.Event()
+        try:
+            bundle = await asyncio.to_thread(
+                index.retrieve,
+                request.query,
+                dialogue=dialogue,
+                focus=self._code_focus,
+                active_file=self._active_file,
+                cancelled=cancelled,
+            )
+        finally:
+            cancelled.set()
+        if (
+            self._stop_requested.is_set()
+            or revision != self._repository_revision
+            or epoch != self._epoch
+        ):
+            raise asyncio.CancelledError
+        self._turn_sources = bundle.references
+        self._code_focus = bundle.references[:2]
+        self._retrieval_metrics = (
+            epoch,
+            bundle.elapsed_seconds,
+            len(bundle.references),
+        )
+        self.sources.emit(epoch, bundle.references, bundle.elapsed_seconds)
+        return ModelRequest(
+            input=request.input + "\n\n" + bundle.text,
+            instructions=request.instructions + PROJECT_INSTRUCTIONS,
+            query=request.query,
+        )
 
     def submit_text(self, text: str, role: SpeakerRole) -> bool:
         """Queue a test utterance on the same loop that owns live turns."""
@@ -155,7 +265,7 @@ class AssistantWorker(QThread):
         self._stop = asyncio.Event()
         options = self.options
         provider = DeepSeekProvider(options.settings)
-        session = Session(provider)
+        session = Session(provider, context_resolver=self._resolve_context)
         request_started: float | None = None
         first_token: float | None = None
 
@@ -164,6 +274,7 @@ class AssistantWorker(QThread):
             if first_token is None and request_started is not None:
                 first_token = perf_counter() - request_started
             self.response.emit(self._epoch, event.text)
+            self._reply_text += event.text
 
         def failed(exc: BaseException) -> None:
             self.response_finished.emit(self._epoch, "失败")
@@ -174,6 +285,16 @@ class AssistantWorker(QThread):
             self._stop.set()
 
         def finished(result: TurnResult) -> None:
+            cited = tuple(
+                dict.fromkeys(
+                    int(n) - 1 for n in re.findall(r"\[S(\d+)\]", self._reply_text)
+                )
+            )
+            references = tuple(
+                self._turn_sources[i] for i in cited if 0 <= i < len(self._turn_sources)
+            )
+            if references:
+                self._code_focus = references[:4]
             self.response_finished.emit(
                 self._epoch,
                 "本地截断" if result.finish_reason == "local_limit" else "已完成",
@@ -186,6 +307,12 @@ class AssistantWorker(QThread):
                         perf_counter() - request_started,
                         result.finish_reason,
                         result.output_characters,
+                        self._retrieval_metrics[1]
+                        if self._retrieval_metrics[0] == self._epoch
+                        else 0.0,
+                        self._retrieval_metrics[2]
+                        if self._retrieval_metrics[0] == self._epoch
+                        else 0,
                     ),
                 )
 
@@ -207,6 +334,8 @@ class AssistantWorker(QThread):
             self._assistant.handle_speech_started(event)
             if event.source == "system":
                 request_started, first_token = perf_counter(), None
+                self._reply_text = ""
+                self._turn_sources = ()
                 self._epoch += 1
                 self.response_started.emit(self._epoch)
 

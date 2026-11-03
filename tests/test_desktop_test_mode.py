@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ pytest.importorskip("PySide6.QtWidgets")
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QInputMethodEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPlainTextEdit
 
 from contextshift.desktop import worker as worker_module
 from contextshift.desktop.window import MainWindow
@@ -83,7 +84,7 @@ def window(app, tmp_path, runtime):
     view.test_mode.setChecked(True)
     yield view
     view.close()
-    wait(app, lambda: view.worker is None)
+    wait(app, lambda: view.worker is None and not view.workspace._jobs)
     view.close()
 
 
@@ -97,6 +98,168 @@ def send(window, text, role="interviewer"):
     composer.role.setCurrentIndex(composer.role.findData(role))
     composer.editor.setPlainText(text)
     composer.send.click()
+
+
+def project(app, window, root, *, notes=""):
+    root.mkdir(parents=True, exist_ok=True)
+    window.workspace.open_project(root)
+    wait(app, lambda: window.workspace.index is not None)
+    window.workspace.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Checked)
+    window.workspace.notes = notes
+    window.workspace._invalidate()
+    wait(
+        app,
+        lambda: (
+            window.workspace.index is not None and bool(window.workspace.index.files)
+        ),
+    )
+
+
+def test_project_followups_use_code_and_true_speech_without_an_extra_session(
+    app,
+    window,
+    runtime,
+    tmp_path,
+):
+    root = tmp_path / "demo-project"
+    root.mkdir()
+    (root / "cache.py").write_text(
+        "def refresh_cache():\n    try:\n        return load()\n    except Exception:\n        return previous_cache\n\ndef concurrent_refresh():\n    with refresh_lock:\n        return refresh_cache()\n"
+    )
+    launch(app, window)
+    worker = window.worker
+    project(app, window, root, notes="为了保留可用结果，刷新失败时保留旧缓存。")
+    send(window, "缓存刷新在哪里？")
+    wait(app, lambda: runtime.streams_closed == [1])
+    assert "previous_cache" in runtime.requests[0].input
+    assert "为了保留可用结果" in runtime.requests[0].input
+    assert "推测" in runtime.requests[0].instructions
+    send(window, "我负责了缓存模块", "candidate")
+    wait(app, lambda: window.feed.messages[-1].role == "microphone")
+    send(window, "失败了怎么办？")
+    wait(app, lambda: runtime.streams_closed == [1, 2])
+    send(window, "那两个线程同时刷新呢？")
+    wait(app, lambda: runtime.streams_closed == [1, 2, 3])
+    assert window.worker is worker and len(runtime.providers) == 1
+    assert "候选人：我负责了缓存模块" in runtime.requests[-1].input
+    assert "refresh_lock" in runtime.requests[-1].input
+    assert "测试建议" not in runtime.requests[-1].input
+    assert "检索" in window.composer.details.text()
+    actual = worker._assistant.history.entries
+    assert actual == (
+        "缓存刷新在哪里？",
+        "我负责了缓存模块",
+        "失败了怎么办？",
+        "那两个线程同时刷新呢？",
+    )
+    source_buttons = window.feed.messages[-1].sources.findChildren(
+        type(window.composer.send)
+    )
+    assert source_buttons
+    source_buttons[0].click()
+    assert window.workspace._dialogs
+    editor = window.workspace._dialogs[-1].findChild(QPlainTextEdit)
+    assert editor.isReadOnly() and "previous_cache" in editor.toPlainText()
+
+
+def test_switching_projects_keeps_dialogue_but_revokes_old_code_and_source_links(
+    app,
+    window,
+    runtime,
+    tmp_path,
+):
+    a, b = tmp_path / "project-a", tmp_path / "project-b"
+    a.mkdir()
+    b.mkdir()
+    (a / "module.py").write_text("def refresh_cache(): return 'A_ONLY'\n")
+    (b / "module.py").write_text("def refresh_cache(): return 'B_ONLY'\n")
+    launch(app, window)
+    project(app, window, a, notes="A_DESIGN_ONLY")
+    send(window, "我刚才讲的是第一个项目", "candidate")
+    send(window, "缓存逻辑在哪里？")
+    wait(app, lambda: runtime.streams_closed == [1])
+    old_ref = window.worker._code_focus[0]
+    old_worker = window.worker
+    project(app, window, b, notes="B_DESIGN_ONLY")
+    send(window, "现在这个项目的缓存逻辑呢？")
+    wait(app, lambda: runtime.streams_closed == [1, 2])
+    request = runtime.requests[-1]
+    material = request.input.split("<project_context>", 1)[1]
+    assert "B_ONLY" in material and "B_DESIGN_ONLY" in material
+    assert "A_ONLY" not in material and "A_DESIGN_ONLY" not in material
+    assert "候选人：我刚才讲的是第一个项目" in request.input
+    assert window.worker is old_worker
+    window.workspace.open_source(old_ref)
+    assert not window.workspace._dialogs
+    assert "当前索引" in window.workspace.status.text()
+
+
+def test_unchecking_during_retrieval_cannot_send_stale_code(
+    app,
+    window,
+    runtime,
+    tmp_path,
+    monkeypatch,
+):
+    from contextshift.repository import RepositoryIndex
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "cache.py").write_text("def refresh_cache(): return 'REVOKED_CODE'\n")
+    launch(app, window)
+    project(app, window, root)
+    entered, release = threading.Event(), threading.Event()
+    retrieve = RepositoryIndex.retrieve
+
+    def delayed(self, query, **kwargs):
+        if query == "旧的缓存问题":
+            entered.set()
+            assert release.wait(4)
+        return retrieve(self, query, **kwargs)
+
+    monkeypatch.setattr(RepositoryIndex, "retrieve", delayed)
+    try:
+        send(window, "旧的缓存问题")
+        wait(app, entered.is_set)
+        window.workspace.tree.topLevelItem(0).setCheckState(0, Qt.CheckState.Unchecked)
+        assert window.workspace.index is None
+        wait(
+            app,
+            lambda: (
+                window.workspace.index is not None and not window.workspace.index.files
+            ),
+        )
+        send(window, "新的问题")
+        wait(app, lambda: len(runtime.requests) == 1)
+        assert "REVOKED_CODE" not in runtime.requests[0].input
+        release.set()
+        wait(app, lambda: runtime.streams_closed == [1])
+        assert len(runtime.requests) == 1
+    finally:
+        release.set()
+
+
+def test_source_edits_refresh_without_clearing_the_meeting(
+    app, window, runtime, tmp_path
+):
+    root = tmp_path / "project"
+    root.mkdir()
+    file = root / "cache.py"
+    file.write_text("def refresh_cache(): return 'OLD_IMPLEMENTATION'\n")
+    launch(app, window)
+    project(app, window, root)
+    send(window, "缓存在哪里？")
+    wait(app, lambda: runtime.streams_closed == [1])
+    fingerprint = window.workspace.index.fingerprint
+    file.write_text("def refresh_cache(): return 'NEW_IMPLEMENTATION'\n")
+    wait(app, lambda: not window.workspace._jobs)
+    window.workspace._poll()
+    wait(app, lambda: window.workspace.index.fingerprint != fingerprint)
+    send(window, "刷新逻辑现在是什么？")
+    wait(app, lambda: runtime.streams_closed == [1, 2])
+    material = runtime.requests[-1].input.split("<project_context>", 1)[1]
+    assert "NEW_IMPLEMENTATION" in material and "OLD_IMPLEMENTATION" not in material
+    assert "缓存在哪里？" in runtime.requests[-1].input
 
 
 def test_test_mode_needs_only_cloud_configuration(app, window):
