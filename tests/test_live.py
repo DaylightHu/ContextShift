@@ -26,6 +26,8 @@ class FakeSession:
         self,
         question: str,
         on_delta: Callable[[TurnDelta], None],
+        *,
+        query: str = "",
     ) -> tuple[int, asyncio.Task[TurnResult]]:
         del on_delta
         self.questions.append(question)

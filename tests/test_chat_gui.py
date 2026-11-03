@@ -142,7 +142,9 @@ def test_main_window_contains_only_icons_and_message_content(window):
     assert not window.centralWidget().findChildren(QLineEdit)
     assert not window.centralWidget().findChildren(QPushButton)
     visible_labels = [
-        label.text() for label in window.findChildren(QLabel) if label.isVisible()
+        label.text()
+        for label in window.findChildren(QLabel)
+        if label.isVisible() and not window.workspace.isAncestorOf(label)
     ]
     assert visible_labels == ["●"]
     assert [m.findChild(Avatar).role for m in window.feed.messages] == [

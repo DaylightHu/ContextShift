@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from pydantic import ValidationError
-from PySide6.QtCore import QSettings, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QPushButton,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -26,6 +27,7 @@ from contextshift.config import Settings
 from contextshift.desktop.app import project_directory
 from contextshift.desktop.chat import Avatar, ChatFeed, ChatMessage, TestComposer
 from contextshift.desktop.worker import AssistantWorker, DesktopOptions, ReplyMetrics
+from contextshift.desktop.workspace import WorkspacePanel
 from contextshift.speech.audio import list_input_devices
 
 _STYLE = """
@@ -53,6 +55,13 @@ QScrollBar:vertical { background: #10131c; width: 9px; margin: 7px 2px; }
 QScrollBar::handle:vertical { background: #394159; min-height: 35px; border-radius: 3px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QTreeWidget#projectTree { background: #10131c; border: none; color: #b7c2d9; font-size: 12px; }
+QTreeWidget::item { padding: 5px 2px; }
+QTreeWidget::item:selected { background: #263447; }
+QLabel#workspaceStatus { color: #8793ae; font-size: 11px; }
+QLabel#workspaceTitle { color: #cad3f5; font-weight: 600; }
+QSplitter::handle { background: #252d3c; width: 1px; }
+QPushButton#sourceLink { color: #8bd5ca; background: transparent; border: none; padding: 2px; font-size: 11px; text-align: left; }
 """
 
 
@@ -99,7 +108,7 @@ class MainWindow(QMainWindow):
         self.composer: TestComposer | None = None
         self._manage_application = manage_application
         self.setWindowTitle("ContextShift")
-        self.resize(860, 720)
+        self.resize(1180, 760)
         self.setMinimumSize(540, 400)
         self.setStyleSheet(_STYLE)
         palette = self.palette()
@@ -130,8 +139,21 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(self._open_settings)
         toolbar.addWidget(self.settings_button)
         layout.addLayout(toolbar)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace = WorkspacePanel(self.preferences)
+        self.workspace.index_changed.connect(self._repository_changed)
+        self.workspace.focus_changed.connect(self._file_focus_changed)
+        self.workspace.idle.connect(self._workspace_idle)
+        self.splitter.addWidget(self.workspace)
+        chat = QWidget()
+        self._chat_layout = QVBoxLayout(chat)
+        self._chat_layout.setContentsMargins(0, 0, 0, 0)
         self.feed = ChatFeed()
-        layout.addWidget(self.feed, 1)
+        self._chat_layout.addWidget(self.feed, 1)
+        self.splitter.addWidget(chat)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([260, 900])
+        layout.addWidget(self.splitter, 1)
         self.loading = LoadingDialog(self)
         self.loading.cancelled.connect(self.close)
         self._build_settings()
@@ -141,6 +163,36 @@ class MainWindow(QMainWindow):
         else:
             self.microphone.addItem("选择麦克风", None)
             self.system.addItem("选择回环输入", None)
+        QTimer.singleShot(0, self.workspace.restore)
+
+    def _repository_changed(self, index):
+        self._end_reply("上下文已更新")
+        self._active_epoch = -1
+        self._active_message = None
+        if self.worker is not None:
+            self.worker.set_repository(
+                index,
+                pending=self.workspace.root is not None and index is None,
+                root=self.workspace.root,
+            )
+
+    def _file_focus_changed(self, relative):
+        if self.worker is not None:
+            self.worker.set_active_file(relative)
+
+    def _workspace_idle(self):
+        if self._closing:
+            self.close()
+
+    def _sources_ready(self, epoch, references, elapsed):
+        if self._closing or not self._ready or epoch != self._active_epoch:
+            return
+        if references:
+            self._ensure_reply().set_sources(references, self.workspace.open_source)
+        if self.composer is not None:
+            self.composer.details.setText(
+                f"{self.worker.options.settings.model} · 检索 {elapsed:.3f}s · {len(references)} 处来源"
+            )
 
     def _build_settings(self) -> None:
         self.settings_dialog = QDialog(self)
@@ -331,7 +383,7 @@ class MainWindow(QMainWindow):
         self._active_message = None
         self._failure = ""
         if self.composer is not None:
-            self._layout.removeWidget(self.composer)
+            self._chat_layout.removeWidget(self.composer)
             self.composer.hide()
             self.composer.deleteLater()
             self.composer = None
@@ -345,9 +397,14 @@ class MainWindow(QMainWindow):
                 f"云端输出上限：{options.settings.max_output_tokens} tokens\n"
                 "复用正式模式的上下文、提示词与本地输出限制。"
             )
-            self._layout.addWidget(self.composer)
+            self._chat_layout.addWidget(self.composer)
         worker = AssistantWorker(options, self)
         self.worker = worker
+        worker.set_repository(
+            self.workspace.index,
+            pending=self.workspace.root is not None and self.workspace.index is None,
+            root=self.workspace.root,
+        )
 
         def current(function):
             return lambda *args: function(*args) if self.worker is worker else None
@@ -361,6 +418,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(current(self._failed))
         worker.request_failed.connect(current(self._request_failed))
         worker.metrics.connect(current(self._metrics))
+        worker.sources.connect(current(self._sources_ready))
         worker.finished.connect(current(self._worker_finished))
         self._save_preferences()
         worker.start()
@@ -416,6 +474,11 @@ class MainWindow(QMainWindow):
         self.composer.details.setText(
             f"{self.worker.options.settings.model} · {first} · "
             f"{metrics.elapsed_seconds:.2f}s · {finish}"
+            + (
+                f" · 检索 {metrics.retrieval_seconds:.3f}s · {metrics.source_count} 处来源"
+                if self.workspace.root is not None
+                else ""
+            )
         )
         if self._active_message is not None:
             self._active_message.setToolTip(
@@ -518,12 +581,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True
+        workspace_stopped = self.workspace.shutdown()
         self._ready = False
         self._active_epoch = -1
         self.settings_dialog.hide()
         self.loading.hide()
         if self.worker is not None:
             self.worker.request_stop()
+            event.ignore()
+            return
+        if not workspace_stopped:
             event.ignore()
             return
         event.accept()

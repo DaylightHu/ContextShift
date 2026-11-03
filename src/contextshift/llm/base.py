@@ -11,6 +11,7 @@ class ModelRequest:
 
     input: str
     instructions: str
+    query: str = ""
 
 
 class ModelProvider(Protocol):

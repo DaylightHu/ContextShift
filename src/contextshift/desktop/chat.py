@@ -8,6 +8,7 @@ head. Icons use Qt geometry and the system font, with no external assets.
 
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 from typing import Literal
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
@@ -23,6 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -268,9 +270,44 @@ class ChatMessage(QWidget):
         self.setAccessibleName(title or ROLES[role].title)
         self.body = MessageText()
         column.addWidget(self.body)
+        self.sources = QWidget()
+        self._source_layout = QGridLayout(self.sources)
+        self._source_layout.setContentsMargins(0, 0, 0, 0)
+        self._source_layout.setSpacing(4)
+        self.sources.hide()
+        column.addWidget(self.sources)
         row.addWidget(self.bubble, 1)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.set_text(text)
+
+    def set_sources(self, references, open_source):
+        while self._source_layout.count():
+            item = self._source_layout.takeAt(0)
+            item.widget().deleteLater()
+        for i, reference in enumerate(references):
+            symbol = reference.symbol.split(",", 1)[0].strip()
+            root = Path(reference.workspace).name if reference.workspace else ""
+            name = reference.path.rsplit("/", 1)[-1]
+            label = (
+                f"{root}/{name}:{reference.start_line}"
+                if root
+                else f"{name}:{reference.start_line}"
+            )
+            if symbol and symbol != "模块声明":
+                label += f" · {symbol}"
+            button = QPushButton(label)
+            button.setObjectName("sourceLink")
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            button.setMinimumWidth(0)
+            button.setToolTip(
+                f"{reference.path}:{reference.start_line}-{reference.end_line}\n{reference.symbol}"
+            )
+            button.clicked.connect(
+                lambda checked=False, ref=reference: open_source(ref)
+            )
+            self._source_layout.addWidget(button, i // 2, i % 2)
+        self.sources.setVisible(bool(references))
+        self.changed.emit()
 
     @property
     def pinned(self) -> bool:
