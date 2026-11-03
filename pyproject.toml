@@ -21,6 +21,7 @@ bundle = ["pyinstaller>=6.12"]
 speech = [
     "funasr>=1.2.7",
     "numpy>=2.2.0",
+    "pywebrtc-audio==0.2.0",
     "sounddevice>=0.5.1",
     "torch>=2.15.0",
     "torchaudio>=2.11.1",

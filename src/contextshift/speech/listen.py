@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from inspect import isawaitable
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 
 from contextshift.speech.asr import SenseVoiceTranscriber
 from contextshift.speech.audio import AudioConfig, MicrophoneStream
+from contextshift.speech.echo import EchoProcessor
 from contextshift.speech.errors import SpeechConfigurationError
 from contextshift.speech.events import (
     AudioSource,
@@ -79,6 +80,7 @@ class _TranscriptionJob:
     samples: Any
     duration: float
     source: AudioSource = "microphone"
+    audio_processing: Literal["raw", "aec", "text"] = "raw"
 
 
 class _SpeechEventTracker:
@@ -144,6 +146,7 @@ async def _run_transcription_worker(
                 asr_elapsed=asr_elapsed,
                 rtf=rtf,
                 source=job.source,
+                audio_processing=job.audio_processing,
             )
             if on_transcript is not None:
                 result = on_transcript(event)
@@ -171,6 +174,7 @@ async def run_audio_listener(
     on_transcript: TranscriptHandler | None = None,
     prepared: PreparedChannel | None = None,
     on_ready: Callable[[], None] | None = None,
+    echo: EchoProcessor | None = None,
 ) -> None:
     """Capture until cancelled and transcribe closed VAD segments in order."""
 
@@ -215,21 +219,42 @@ async def run_audio_listener(
                 samples=samples[start:end],
                 duration=duration,
                 source=source,
+                audio_processing="aec" if source == "microphone" and echo else "raw",
             )
         )
 
     print(f"开始监听 {source}，按 Ctrl-C 停止。", flush=True)
     try:
-        with MicrophoneStream(config) as microphone:
-            if on_ready is not None:
+        capture_options = (
+            {"strict": True, "on_packet": echo.publish if source == "system" else None}
+            if echo is not None
+            else {}
+        )
+        with MicrophoneStream(config, **capture_options) as microphone:
+            announced_ready = False
+            if on_ready is not None and (source != "microphone" or echo is None):
                 on_ready()
+                announced_ready = True
             while True:
                 if worker.done():
                     await worker  # Surface ASR failures instead of capturing forever.
                 try:
-                    block = await asyncio.to_thread(microphone.next_block)
+                    if source == "microphone" and echo is not None:
+                        packet = await asyncio.to_thread(microphone.next_packet)
+                        block = await asyncio.to_thread(echo.clean, packet)
+                        if block is None:
+                            continue
+                    else:
+                        block = await asyncio.to_thread(microphone.next_block)
                 except TimeoutError:
+                    if echo is not None:
+                        raise SpeechConfigurationError(
+                            f"{source} 音频输入中断，已停止监听。"
+                        )
                     continue
+                if not announced_ready and on_ready is not None:
+                    on_ready()
+                    announced_ready = True
                 blocks.append(block)
                 segments = await asyncio.to_thread(vad.accept, block)
                 for segment in segments:
@@ -300,12 +325,37 @@ async def run_dual_audio_listener(
             )
     # Validate both configs before either task opens a capture stream.
     _ = microphone_config.block_size, system_config.block_size
+    if (
+        microphone_config.sample_rate != system_config.sample_rate
+        or microphone_config.sample_rate != 16_000
+        or microphone_config.block_ms % 10
+        or system_config.block_ms % 10
+    ):
+        raise SpeechConfigurationError(
+            "回声消除要求两路 16 kHz，音频块为 10 ms 的整数倍。"
+        )
     if prepared_channels is not None and set(prepared_channels) != {
         "microphone",
         "system",
     }:
         raise SpeechConfigurationError("两路模型尚未全部预热。")
     opened: set[AudioSource] = set()
+    echo = EchoProcessor(microphone_config.sample_rate)
+
+    async def deliver_transcript(event: TranscriptReady) -> None:
+        # Enforce this at the live audio boundary, before either GUI or history.
+        # Typed test-mode events do not pass through this audio-only boundary.
+        if event.source == "microphone" and event.audio_processing != "aec":
+            raise SpeechConfigurationError("未经回声处理的麦克风转写已被拦截。")
+        if on_transcript is not None:
+            result = on_transcript(event)
+            if isawaitable(result):
+                await result
+        else:
+            print(
+                f"\n[{event.source} Speech {event.utterance_id}] {event.text}",
+                flush=True,
+            )
 
     def channel_opened(source: AudioSource) -> None:
         if source in opened:
@@ -323,7 +373,8 @@ async def run_dual_audio_listener(
                 audio_config=config,
                 asr_device=asr_device,
                 on_speech_started=on_speech_started,
-                on_transcript=on_transcript,
+                on_transcript=deliver_transcript,
+                echo=echo,
                 **(
                     {"prepared": prepared_channels[source]}
                     if prepared_channels is not None
@@ -347,6 +398,7 @@ async def run_dual_audio_listener(
         for task in done:
             task.result()
     finally:
+        echo.close()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -63,7 +63,7 @@ def main() -> None:
     if not args.without_speech:
         missing = [
             name
-            for name in ("funasr", "sounddevice", "torchaudio")
+            for name in ("funasr", "sounddevice", "torchaudio", "pywebrtc_audio")
             if importlib.util.find_spec(name) is None
         ]
         if missing:
