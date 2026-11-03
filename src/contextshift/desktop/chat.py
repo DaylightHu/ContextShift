@@ -8,6 +8,7 @@ head. Icons use Qt geometry and the system font, with no external assets.
 
 from dataclasses import dataclass
 from math import ceil
+from pathlib import Path
 from typing import Literal
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
@@ -284,9 +285,17 @@ class ChatMessage(QWidget):
             item = self._source_layout.takeAt(0)
             item.widget().deleteLater()
         for i, reference in enumerate(references):
-            button = QPushButton(
-                f"[S{i + 1}] {reference.path.rsplit('/', 1)[-1]}:{reference.start_line}"
+            symbol = reference.symbol.split(",", 1)[0].strip()
+            root = Path(reference.workspace).name if reference.workspace else ""
+            name = reference.path.rsplit("/", 1)[-1]
+            label = (
+                f"{root}/{name}:{reference.start_line}"
+                if root
+                else f"{name}:{reference.start_line}"
             )
+            if symbol and symbol != "模块声明":
+                label += f" · {symbol}"
+            button = QPushButton(label)
             button.setObjectName("sourceLink")
             button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             button.setMinimumWidth(0)

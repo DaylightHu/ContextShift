@@ -156,6 +156,7 @@ def test_project_followups_use_code_and_true_speech_without_an_extra_session(
         type(window.composer.send)
     )
     assert source_buttons
+    assert len(source_buttons) <= 3
     source_buttons[0].click()
     assert window.workspace._dialogs
     editor = window.workspace._dialogs[-1].findChild(QPlainTextEdit)
@@ -418,6 +419,43 @@ def test_metrics_and_limit_use_the_same_production_session(
     else:
         assert result.first_token_seconds is None and result.output_characters == 0
         assert "无文本输出" in window.composer.details.text()
+
+
+def test_appended_project_joins_the_same_model_context(app, window, runtime, tmp_path):
+    client = tmp_path / "nio_packages"
+    platform = tmp_path / "nasa-platform"
+    client.mkdir()
+    platform.mkdir()
+    (client / "AppBridge.java").write_text(
+        'class AppBridge { void call() { PlatformClient.send("CLIENT_SIDE"); } }\n'
+    )
+    (platform / "PlatformClient.java").write_text(
+        'class PlatformClient { static void send() { log("PLATFORM_SIDE"); } }\n'
+    )
+    launch(app, window)
+    project(app, window, client)
+    worker = window.worker
+    window.workspace.add_project(platform)
+    wait(
+        app,
+        lambda: (
+            window.workspace.index is not None
+            and window.workspace.tree.topLevelItemCount() == 2
+        ),
+    )
+    window.workspace.tree.topLevelItem(1).setCheckState(0, Qt.CheckState.Checked)
+    wait(
+        app,
+        lambda: (
+            window.workspace.index is not None
+            and bool(window.workspace.index.child(platform).files)
+        ),
+    )
+    send(window, "PlatformClient.send 在哪里实现？")
+    wait(app, lambda: runtime.streams_closed == [1])
+    assert window.worker is worker
+    assert "CLIENT_SIDE" in runtime.requests[0].input
+    assert "PLATFORM_SIDE" in runtime.requests[0].input
 
 
 def test_switch_to_live_clears_test_history_and_removes_composer(

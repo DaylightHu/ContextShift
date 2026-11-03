@@ -1,5 +1,6 @@
 """Scope, source fidelity, follow-up retrieval and local refresh behavior."""
 
+import re
 import subprocess
 import threading
 
@@ -8,6 +9,7 @@ import pytest
 from contextshift.repository import (
     Inventory,
     RepositoryIndex,
+    WorkspaceIndex,
     allowed_path,
     scan_repository,
 )
@@ -286,3 +288,89 @@ def test_search_can_locate_contextshift_preemption_and_stale_output_guards():
     assert "src/contextshift/runtime/turn_controller.py" in {
         r.path for r in second.references
     }
+
+
+def test_java_retrieval_promotes_interface_caller_and_network_factory(tmp_path):
+    write(
+        tmp_path,
+        "TaskUploadApiService.java",
+        """package com.nasa.api;
+import retrofit2.http.POST;
+public interface TaskUploadApiService {
+    @POST("task/upload")
+    @NasaRequestResponse
+    LiveData<ApiResponse<Task>> uploadTask(Task body);
+}
+""",
+    )
+    write(
+        tmp_path,
+        "NasaTaskRepository.java",
+        """public class NasaTaskRepository {
+    private final TaskUploadApiService service =
+        TspNetManager.getServer("nasa-app-api").create(TaskUploadApiService.class);
+    public LiveData<ApiResponse<Task>> upload(Task task) {
+        return service.uploadTask(task);
+    }
+}
+""",
+    )
+    write(
+        tmp_path,
+        "TspNetManager.java",
+        """public final class TspNetManager {
+    public static Retrofit getServer(String name) { return servers.get(name); }
+}
+""",
+    )
+    write(
+        tmp_path,
+        "AudioRecorderTools.java",
+        """public class AudioRecorderTools {
+    public void record() { logger.info("app api recorder"); }
+}
+""",
+    )
+    write(tmp_path, "build.gradle", 'implementation project(":app")\n')
+    snapshot = index(tmp_path)
+    bundle = snapshot.retrieve("你目前的架构是怎么跟 nasa-app-api 联动的？")
+    core = {reference.path for reference in bundle.references[:3]}
+    assert "NasaTaskRepository.java" in core
+    assert "TaskUploadApiService.java" in core
+    assert "AudioRecorderTools.java" not in core
+    assert any(
+        name == "uploadTask"
+        for _, name in snapshot.files["TaskUploadApiService.java"].symbols
+    )
+    assert "TspNetManager.getServer" in bundle.text
+
+
+def test_project_instructions_are_direct_speech_not_coaching():
+    from contextshift.repository import PROJECT_INSTRUCTIONS
+
+    assert "第一句直接回答问题" in PROJECT_INSTRUCTIONS
+    assert "不要写‘可答’" in PROJECT_INSTRUCTIONS
+
+
+def test_workspace_retrieval_combines_roots_and_renumbers_sources(tmp_path):
+    client = tmp_path / "nio_packages"
+    platform = tmp_path / "nasa-platform"
+    write(
+        client,
+        "RouteActivity.java",
+        "class RouteActivity { void upload() { PlatformClient.send(); } }\n",
+    )
+    write(
+        platform,
+        "PlatformClient.java",
+        "class PlatformClient { static void send() { dispatch(); } }\n",
+    )
+    workspace = WorkspaceIndex((index(client), index(platform)))
+    bundle = workspace.retrieve("PlatformClient.send 在哪里实现？")
+    assert {reference.workspace for reference in bundle.references} == {
+        str(client),
+        str(platform),
+    }
+    citations = re.findall(r"\[S(\d+)\]", bundle.text)
+    assert citations == [str(number) for number in range(1, len(citations) + 1)]
+    assert len(bundle.text) <= 20000

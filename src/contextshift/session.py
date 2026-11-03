@@ -13,7 +13,10 @@ from contextshift.runtime import (
     TurnController,
 )
 
-DEFAULT_INSTRUCTIONS = "直接回答，不复述问题。最多三行。不要使用开场白、总结句或比喻。"
+DEFAULT_INSTRUCTIONS = (
+    "直接给出此刻可说的回答，不复述问题。最多三行。"
+    "不要使用开场白、总结句、比喻或‘建议先说’之类的指导语。"
+)
 
 
 @dataclass(frozen=True, slots=True)

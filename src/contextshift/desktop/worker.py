@@ -19,6 +19,7 @@ from contextshift.repository import (
     PROJECT_INSTRUCTIONS,
     RepositoryIndex,
     SourceReference,
+    WorkspaceIndex,
 )
 from contextshift.session import Session, TurnDelta, TurnResult
 from contextshift.speech.audio import AudioConfig
@@ -79,7 +80,7 @@ class AssistantWorker(QThread):
         self._announced_ready = False
         self._accepting_text = threading.Event()
         self._text_handler: Callable[[str, SpeakerRole], None] | None = None
-        self._repository: RepositoryIndex | None = None
+        self._repository: RepositoryIndex | WorkspaceIndex | None = None
         self._repository_revision = 0
         self._code_focus: tuple[SourceReference, ...] = ()
         self._active_file = ""
@@ -91,7 +92,7 @@ class AssistantWorker(QThread):
 
     def set_repository(
         self,
-        index: RepositoryIndex | None,
+        index: RepositoryIndex | WorkspaceIndex | None,
         *,
         pending: bool = False,
         root: Path | None = None,
@@ -108,9 +109,14 @@ class AssistantWorker(QThread):
                 self._active_file = ""
             elif index is not None:
                 self._code_focus = tuple(
-                    r
-                    for r in self._code_focus
-                    if r.path in index.files and index.files[r.path].digest == r.digest
+                    reference
+                    for reference in self._code_focus
+                    if (
+                        index.contains_reference(reference)
+                        if isinstance(index, WorkspaceIndex)
+                        else reference.path in index.files
+                        and index.files[reference.path].digest == reference.digest
+                    )
                 )
             self._repository_root = new_root
             if self._assistant is not None:
@@ -174,7 +180,6 @@ class AssistantWorker(QThread):
             bundle.elapsed_seconds,
             len(bundle.references),
         )
-        self.sources.emit(epoch, bundle.references, bundle.elapsed_seconds)
         return ModelRequest(
             input=request.input + "\n\n" + bundle.text,
             instructions=request.instructions + PROJECT_INSTRUCTIONS,
@@ -293,8 +298,15 @@ class AssistantWorker(QThread):
             references = tuple(
                 self._turn_sources[i] for i in cited if 0 <= i < len(self._turn_sources)
             )
-            if references:
-                self._code_focus = references[:4]
+            core_references = references or self._turn_sources[:3]
+            if core_references:
+                self._code_focus = core_references[:4]
+            retrieval_seconds = (
+                self._retrieval_metrics[1]
+                if self._retrieval_metrics[0] == self._epoch
+                else 0.0
+            )
+            self.sources.emit(self._epoch, core_references[:3], retrieval_seconds)
             self.response_finished.emit(
                 self._epoch,
                 "本地截断" if result.finish_reason == "local_limit" else "已完成",
@@ -310,9 +322,7 @@ class AssistantWorker(QThread):
                         self._retrieval_metrics[1]
                         if self._retrieval_metrics[0] == self._epoch
                         else 0.0,
-                        self._retrieval_metrics[2]
-                        if self._retrieval_metrics[0] == self._epoch
-                        else 0,
+                        len(core_references[:3]),
                     ),
                 )
 
