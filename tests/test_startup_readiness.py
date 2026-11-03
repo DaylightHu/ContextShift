@@ -81,6 +81,9 @@ async def test_two_open_streams_are_required_for_ready_and_ready_fires_once(
     callbacks = {}
     entered = asyncio.Event()
     announced = []
+    monkeypatch.setattr(
+        listen, "EchoProcessor", lambda rate: SimpleNamespace(close=lambda: None)
+    )
 
     async def listener(*, source, on_ready, **kwargs):
         callbacks[source] = on_ready

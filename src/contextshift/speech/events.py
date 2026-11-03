@@ -42,6 +42,7 @@ class TranscriptReady:
     asr_elapsed: float
     rtf: float
     source: AudioSource = "microphone"
+    audio_processing: Literal["raw", "aec", "text"] = "raw"
     role: SpeakerRole = field(init=False)
 
     def __post_init__(self) -> None:

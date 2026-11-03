@@ -1,7 +1,9 @@
 """Microphone discovery and 16 kHz block capture."""
 
 import queue
+from collections.abc import Callable
 from dataclasses import dataclass
+from time import perf_counter
 from types import TracebackType
 from typing import Any, Self
 
@@ -35,6 +37,12 @@ class InputDevice:
     default_sample_rate: float
 
 
+@dataclass(frozen=True, slots=True)
+class AudioPacket:
+    samples: Any
+    captured_at: float
+
+
 def _sounddevice() -> Any:
     try:
         import sounddevice as sd
@@ -64,30 +72,56 @@ def list_input_devices() -> list[InputDevice]:
 class MicrophoneStream:
     """Queue-based PortAudio input stream for async consumers."""
 
-    def __init__(self, config: AudioConfig) -> None:
+    def __init__(
+        self,
+        config: AudioConfig,
+        *,
+        strict: bool = False,
+        on_packet: Callable[[AudioPacket], None] | None = None,
+    ) -> None:
         self.config = config
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=16)
         self._stream: Any | None = None
+        self._strict = strict
+        self._on_packet = on_packet
+        self._error: BaseException | None = None
 
     def __enter__(self) -> Self:
         sd = _sounddevice()
+        clock_offset: float | None = None
 
         def callback(indata: Any, frames: int, time: Any, status: Any) -> None:
-            del frames, time
-            if status:
-                # Keep capture alive; the caller receives the audio blocks.
-                pass
-            block = indata.copy().reshape(-1)
+            nonlocal clock_offset
+            if self._error is not None:
+                return
             try:
-                self._queue.put_nowait(block)
-            except queue.Full:
-                # Dropping the oldest block is safer than blocking PortAudio's
-                # callback thread and causing an input overflow.
+                if status and self._strict:
+                    raise SpeechConfigurationError(f"音频采集不连续：{status}")
+                if clock_offset is None:
+                    clock_offset = perf_counter() - time.currentTime
+                packet = AudioPacket(
+                    indata.copy().reshape(-1), clock_offset + time.inputBufferAdcTime
+                )
+                if self._strict and frames != self.config.block_size:
+                    raise SpeechConfigurationError(
+                        "音频采集块长度变化，请重新启动监听。"
+                    )
+                if self._on_packet is not None:
+                    self._on_packet(packet)
                 try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    pass
-                self._queue.put_nowait(block)
+                    self._queue.put_nowait(packet)
+                except queue.Full:
+                    if self._strict:
+                        raise SpeechConfigurationError(
+                            "音频处理落后，已停止监听以防止上下文错位。"
+                        )
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self._queue.put_nowait(packet)
+            except Exception as exc:  # noqa: BLE001 - callback errors reach the consumer
+                self._error = exc
 
         self._stream = sd.InputStream(
             samplerate=self.config.sample_rate,
@@ -122,7 +156,17 @@ class MicrophoneStream:
     def next_block(self, timeout: float = 1.0) -> Any:
         """Block until the next float32 mono audio block is available."""
 
+        return self.next_packet(timeout).samples
+
+    def next_packet(self, timeout: float = 1.0) -> AudioPacket:
+        if self._error is not None:
+            raise self._error
         try:
-            return self._queue.get(timeout=timeout)
+            packet = self._queue.get(timeout=timeout)
         except queue.Empty as exc:
+            if self._error is not None:
+                raise self._error
             raise TimeoutError from exc
+        if self._error is not None:
+            raise self._error
+        return packet

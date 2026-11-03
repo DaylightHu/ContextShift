@@ -115,7 +115,9 @@ class LiveAssistant:
         turn_id, task = self._session.submit(model_input, self._on_delta)
         self._active_turn_id = turn_id
         self._tasks.add(task)
-        task.add_done_callback(self._turn_finished)
+        task.add_done_callback(
+            lambda completed: self._turn_finished(turn_id, completed)
+        )
 
     async def close(self) -> None:
         """Cancel generation and wait for tasks owned by the coordinator."""
@@ -128,7 +130,7 @@ class LiveAssistant:
         if self._tasks:
             await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
 
-    def _turn_finished(self, task: asyncio.Task[TurnResult]) -> None:
+    def _turn_finished(self, turn_id: int, task: asyncio.Task[TurnResult]) -> None:
         self._tasks.discard(task)
         if task.cancelled():
             return
@@ -141,5 +143,9 @@ class LiveAssistant:
             ):
                 self._on_turn_finished(result)
         except Exception as exc:  # noqa: BLE001 - surface provider failures
-            if self._on_error is not None:
+            if (
+                not self._closed
+                and turn_id == self._active_turn_id
+                and self._on_error is not None
+            ):
                 self._on_error(exc)

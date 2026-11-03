@@ -25,6 +25,25 @@ class RecordingTranscriber:
         return f"text-{samples}"
 
 
+@pytest.fixture(autouse=True)
+def isolate_native_echo_backend(monkeypatch):
+    # Channel tests inspect scheduling/routing; DSP is exercised in test_echo.py.
+    class Echo:
+        def __init__(self, sample_rate):
+            pass
+
+        def publish(self, packet):
+            pass
+
+        def clean(self, packet):
+            return packet.samples * 0.5
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(listen, "EchoProcessor", Echo)
+
+
 def test_complete_segment_emits_start_once_before_close() -> None:
     events = []
     tracker = _SpeechEventTracker(events.append)
@@ -235,7 +254,7 @@ async def test_capture_to_transcript_keeps_channels_isolated(monkeypatch) -> Non
     both_transcribed = asyncio.Event()
 
     class Stream:
-        def __init__(self, config):
+        def __init__(self, config, **kwargs):
             self.device = config.device
             self.blocks = queue.Queue()
             self.blocks.put(
@@ -255,6 +274,11 @@ async def test_capture_to_transcript_keeps_channels_isolated(monkeypatch) -> Non
             except queue.Empty as exc:
                 raise TimeoutError from exc
 
+        def next_packet(self):
+            from contextshift.speech.audio import AudioPacket
+
+            return AudioPacket(self.next_block(), 0.0)
+
     class Vad:
         pending_start_ms = None
 
@@ -273,7 +297,7 @@ async def test_capture_to_transcript_keeps_channels_isolated(monkeypatch) -> Non
 
         def transcribe(self, samples):
             self.samples.append(float(samples[0]))
-            return "candidate words" if samples[0] == 1 else "interviewer question"
+            return "candidate words" if samples[0] == 0.5 else "interviewer question"
 
     def on_transcript(event):
         transcripts.append(event)
@@ -304,10 +328,115 @@ async def test_capture_to_transcript_keeps_channels_isolated(monkeypatch) -> Non
             ("system", "interviewer", "interviewer question"),
         ]
         assert len(vads) == len(transcribers) == len(streams) == 2
-        assert sorted(vad.samples for vad in vads) == [[1.0], [2.0]]
-        assert sorted(asr.samples for asr in transcribers) == [[1.0], [2.0]]
+        assert sorted(vad.samples for vad in vads) == [[0.5], [2.0]]
+        assert sorted(asr.samples for asr in transcribers) == [[0.5], [2.0]]
+        assert {e.source: e.audio_processing for e in transcripts} == {
+            "microphone": "aec",
+            "system": "raw",
+        }
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     assert closed == {0, 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("processing", ["raw", "text"])
+async def test_live_boundary_rejects_unprocessed_mic_before_ui_or_history(
+    monkeypatch,
+    processing,
+):
+    from contextshift.speech.events import TranscriptReady
+
+    delivered = []
+    stopped = set()
+
+    async def listener(*, source, on_transcript, **kwargs):
+        try:
+            if source == "microphone":
+                await on_transcript(
+                    TranscriptReady(
+                        1,
+                        0,
+                        200,
+                        "speaker echo",
+                        0.01,
+                        0.1,
+                        audio_processing=processing,
+                    )
+                )
+            await asyncio.Event().wait()
+        finally:
+            stopped.add(source)
+
+    monkeypatch.setattr(listen, "run_audio_listener", listener)
+    with pytest.raises(SpeechConfigurationError, match="已被拦截"):
+        await listen.run_dual_audio_listener(
+            asr_model_dir="unused",
+            vad_model_dir="unused",
+            microphone_config=AudioConfig(device=0),
+            system_config=AudioConfig(device=1),
+            on_transcript=delivered.append,
+        )
+    assert delivered == []
+    assert stopped == {"microphone", "system"}
+
+
+@pytest.mark.asyncio
+async def test_mic_is_ready_only_after_aec_has_produced_audio(monkeypatch):
+    import numpy as np
+
+    from contextshift.speech.audio import AudioPacket
+
+    ready = asyncio.Event()
+    calls = []
+
+    class Stream:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            calls.append("closed")
+
+        def next_packet(self):
+            return AudioPacket(np.zeros(3200, dtype=np.float32), 0.0)
+
+    class Echo:
+        def clean(self, packet):
+            calls.append("clean")
+            return None if len(calls) == 1 else packet.samples
+
+    class Vad:
+        pending_start_ms = None
+
+        def accept(self, block):
+            calls.append("vad")
+            return []
+
+    def on_ready():
+        assert calls[:2] == ["clean", "clean"]
+        ready.set()
+
+    monkeypatch.setattr(listen, "MicrophoneStream", Stream)
+    config = AudioConfig(device=0)
+    task = asyncio.create_task(
+        listen.run_audio_listener(
+            source="microphone",
+            asr_model_dir="unused",
+            vad_model_dir="unused",
+            audio_config=config,
+            prepared=listen.PreparedChannel(config, Vad(), RecordingTranscriber()),
+            echo=Echo(),
+            on_ready=on_ready,
+        )
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), 1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert calls[-1] == "closed"

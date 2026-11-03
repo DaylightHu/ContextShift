@@ -49,7 +49,7 @@ def main() -> None:
     parser.add_argument(
         "--without-speech",
         action="store_true",
-        help="仅用于界面打包检查，不包含语音依赖",
+        help="仅打包文字测试模式，不包含语音依赖",
     )
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
@@ -63,7 +63,7 @@ def main() -> None:
     if not args.without_speech:
         missing = [
             name
-            for name in ("funasr", "sounddevice", "torchaudio")
+            for name in ("funasr", "sounddevice", "torchaudio", "pywebrtc_audio")
             if importlib.util.find_spec(name) is None
         ]
         if missing:

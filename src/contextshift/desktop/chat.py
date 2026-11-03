@@ -11,10 +11,22 @@ from math import ceil
 from typing import Literal
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QTextOption
+from PySide6.QtGui import (
+    QColor,
+    QInputMethodEvent,
+    QKeyEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QTextOption,
+)
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
@@ -23,6 +35,78 @@ from PySide6.QtWidgets import (
 )
 
 Role = Literal["microphone", "computer", "ai"]
+
+
+class TestInput(QPlainTextEdit):
+    submitted = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._composing = False
+        self.setFixedHeight(82)
+        self.setAccessibleName("测试消息")
+
+    def inputMethodEvent(self, event: QInputMethodEvent) -> None:
+        self._composing = bool(event.preeditString())
+        super().inputMethodEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if (
+            event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
+            and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            and not self._composing
+        ):
+            if not event.isAutoRepeat():
+                self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class TestComposer(QWidget):
+    """Only test sessions expose typed role simulation and diagnostics."""
+
+    submitted = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(8, 8, 8, 0)
+        column.setSpacing(8)
+        row = QHBoxLayout()
+        self.role = QComboBox()
+        self.role.setAccessibleName("模拟发言角色")
+        self.role.addItem("对方提问", "interviewer")
+        self.role.addItem("我的发言", "candidate")
+        self.role.setToolTip("对方提问触发回答；我的发言只补充上下文。")
+        self.details = QLabel()
+        self.details.setObjectName("testDetails")
+        self.details.setWordWrap(True)
+        row.addWidget(self.role)
+        row.addWidget(self.details, 1)
+        self.send = QPushButton("发送 ↵")
+        self.send.setObjectName("primary")
+        row.addWidget(self.send)
+        column.addLayout(row)
+        self.editor = TestInput()
+        self.editor.setToolTip("Enter 发送 · Shift+Enter 换行")
+        column.addWidget(self.editor)
+        self.role.currentIndexChanged.connect(self._role_changed)
+        self.editor.textChanged.connect(self._update_send)
+        self.editor.submitted.connect(self.submitted)
+        self.send.clicked.connect(self.submitted)
+        self._role_changed()
+
+    def _role_changed(self) -> None:
+        self.editor.setPlaceholderText(
+            "输入对方的问题，测试回答…"
+            if self.role.currentData() == "interviewer"
+            else "输入你已说过的话，作为下一次回答的上下文…"
+        )
+        self._update_send()
+
+    def _update_send(self) -> None:
+        self.send.setEnabled(bool(self.editor.toPlainText().strip()))
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,7 @@ binaries = []
 hiddenimports = ["contextshift.desktop.window", "contextshift.desktop.worker"]
 excluded = []
 if os.environ.get("CONTEXTSHIFT_BUNDLE_SPEECH") == "1":
-    for package in ("funasr", "modelscope", "torchaudio", "sounddevice"):
+    for package in ("funasr", "modelscope", "torchaudio", "sounddevice", "pywebrtc_audio"):
         package_datas, package_binaries, package_imports = collect_all(package)
         datas += package_datas
         binaries += package_binaries
