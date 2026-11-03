@@ -176,6 +176,8 @@ class RepositoryStore:
         root: Path,
         files: dict[str, SourceFile],
         cancelled: threading.Event | None = None,
+        *,
+        changed_paths: frozenset[str] | None = None,
     ) -> None:
         """Atomically add changed files and purge content outside the live scope."""
         if cancelled is not None and cancelled.is_set():
@@ -203,7 +205,12 @@ class RepositoryStore:
                     "DELETE FROM files WHERE root = ? AND path = ?",
                     (root_value, path),
                 )
-            for path, source in files.items():
+            updates = (
+                files.items()
+                if changed_paths is None
+                else ((path, files[path]) for path in changed_paths if path in files)
+            )
+            for path, source in updates:
                 if cancelled is not None and cancelled.is_set():
                     raise InterruptedError("项目索引已取消。")
                 unchanged_content = existing.get(path) == source.digest

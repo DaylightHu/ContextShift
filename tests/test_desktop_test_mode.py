@@ -253,8 +253,6 @@ def test_source_edits_refresh_without_clearing_the_meeting(
     wait(app, lambda: runtime.streams_closed == [1])
     fingerprint = window.workspace.index.fingerprint
     file.write_text("def refresh_cache(): return 'NEW_IMPLEMENTATION'\n")
-    wait(app, lambda: not window.workspace._jobs)
-    window.workspace._poll()
     wait(app, lambda: window.workspace.index.fingerprint != fingerprint)
     send(window, "刷新逻辑现在是什么？")
     wait(app, lambda: runtime.streams_closed == [1, 2])

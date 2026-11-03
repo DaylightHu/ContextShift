@@ -16,7 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-desktop = ["PySide6-Essentials>=6.8"]
+desktop = [
+    "PySide6-Essentials>=6.8",
+    "watchfiles>=1.1,<2",
+]
 bundle = ["pyinstaller>=6.12"]
 speech = [
     "funasr>=1.2.7",

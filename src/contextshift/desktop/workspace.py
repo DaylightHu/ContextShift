@@ -31,12 +31,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from watchfiles import Change, watch
 
 from contextshift.repository import (
     Inventory,
     RepositoryIndex,
     SourceReference,
     WorkspaceIndex,
+    allowed_path,
+    in_scope,
     scan_repository,
 )
 from contextshift.repository_store import RepositoryStore
@@ -52,26 +55,93 @@ class ProjectState:
     inventory: Inventory = field(default_factory=lambda: Inventory(()))
 
 
+@dataclass(slots=True)
+class ProjectUpdate:
+    paths: set[str] = field(default_factory=set)
+    rescan: bool = False
+
+
+class WorkspaceWatcher(QThread):
+    """Translate recursive native file-system notifications into Qt signals."""
+
+    changed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, roots: tuple[Path, ...], parent=None):
+        super().__init__(parent)
+        self.roots = roots
+        self.cancelled = threading.Event()
+
+    def run(self):
+        try:
+            for changes in watch(
+                *(str(root) for root in self.roots),
+                stop_event=self.cancelled,
+                debounce=120,
+                step=50,
+                raise_interrupt=False,
+            ):
+                if self.cancelled.is_set():
+                    return
+                self.changed.emit(tuple(changes))
+        except (OSError, RuntimeError) as exc:
+            if not self.cancelled.is_set():
+                self.failed.emit(str(exc))
+
+    def stop(self):
+        self.cancelled.set()
+
+
 class IndexJob(QThread):
     result = Signal(int, object, object)
     failed = Signal(int, str)
 
-    def __init__(self, revision, projects, previous, store, parent=None):
+    def __init__(
+        self,
+        revision,
+        projects,
+        previous,
+        store,
+        updates=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.revision = revision
         self.projects = projects
         self.previous = previous
         self.store = store
+        self.updates = updates
         self.cancelled = threading.Event()
 
     def run(self):
         try:
             inventories = {}
             indexes = []
-            for root, selection, notes, source_mode in self.projects:
-                requested = selection if source_mode == "files" else ()
-                inventory = scan_repository(root, self.cancelled, requested)
+            for root, selection, notes, source_mode, current_inventory in self.projects:
+                root_key = str(root)
                 previous = self.previous.child(root) if self.previous else None
+                update = (
+                    self.updates.get(root_key) if self.updates is not None else None
+                )
+                if self.updates is not None and update is None and previous is not None:
+                    inventories[root_key] = current_inventory
+                    indexes.append(previous)
+                    continue
+                requested = selection if source_mode == "files" else ()
+                if update is None or update.rescan:
+                    inventory = scan_repository(root, self.cancelled, requested)
+                else:
+                    inventory = current_inventory
+                changed_paths = None
+                if update is not None and previous is not None:
+                    changed = set(update.paths)
+                    if update.rescan:
+                        changed.update(
+                            set(current_inventory.paths).symmetric_difference(
+                                inventory.paths
+                            )
+                        )
+                    changed_paths = frozenset(changed)
                 index = RepositoryIndex.build(
                     root,
                     inventory,
@@ -80,8 +150,9 @@ class IndexJob(QThread):
                     previous=previous,
                     cancelled=self.cancelled,
                     store=self.store,
+                    changed_paths=changed_paths,
                 )
-                inventories[str(root)] = inventory
+                inventories[root_key] = inventory
                 indexes.append(index)
             if not self.cancelled.is_set():
                 self.result.emit(
@@ -123,6 +194,9 @@ class WorkspacePanel(QWidget):
         self._active_root = ""
         self._revision = 0
         self._jobs: set[IndexJob] = set()
+        self._watcher: WorkspaceWatcher | None = None
+        self._watchers: set[WorkspaceWatcher] = set()
+        self._pending_updates: dict[str, ProjectUpdate] = {}
         self._closing = False
         self._dialogs: list[QDialog] = []
         self.setMinimumWidth(180)
@@ -178,9 +252,10 @@ class WorkspacePanel(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(200)
         self._debounce.timeout.connect(self._start_index)
-        self._refresh = QTimer(self)
-        self._refresh.setInterval(3000)
-        self._refresh.timeout.connect(self._poll)
+        self._change_debounce = QTimer(self)
+        self._change_debounce.setSingleShot(True)
+        self._change_debounce.setInterval(160)
+        self._change_debounce.timeout.connect(self._apply_file_changes)
 
     @property
     def root(self) -> Path | None:
@@ -225,8 +300,8 @@ class WorkspacePanel(QWidget):
             self._persist_roots()
             self._update_header()
             self.status.setText("正在读取工作区…")
+            self._restart_watcher()
             self._start_index()
-            self._refresh.start()
 
     @staticmethod
     def _project_key(root: Path, name: str) -> str:
@@ -412,7 +487,9 @@ class WorkspacePanel(QWidget):
         self._close_previews()
         self._cancel_jobs()
         self._debounce.stop()
-        self._refresh.stop()
+        self._change_debounce.stop()
+        self._pending_updates.clear()
+        self._stop_watcher()
         self._revision += 1
         self.projects.clear()
         self.index = None
@@ -442,8 +519,8 @@ class WorkspacePanel(QWidget):
         self.index_changed.emit(None)
         self.focus_changed.emit("")
         self.status.setText(message)
+        self._restart_watcher()
         self._start_index()
-        self._refresh.start()
 
     def _active_state(self) -> ProjectState | None:
         return self.projects.get(self._active_root)
@@ -467,13 +544,113 @@ class WorkspacePanel(QWidget):
         for job in self._jobs:
             job.cancelled.set()
 
-    def _start_index(self):
+    def _restart_watcher(self):
+        self._stop_watcher()
+        if self._closing or not self.projects:
+            return
+        watcher = WorkspaceWatcher(
+            tuple(state.root for state in self.projects.values()), self
+        )
+        self._watcher = watcher
+        self._watchers.add(watcher)
+        watcher.changed.connect(self._file_changes)
+        watcher.failed.connect(self._watch_failed)
+        watcher.finished.connect(lambda: self._watcher_finished(watcher))
+        watcher.start()
+
+    def _stop_watcher(self):
+        watcher, self._watcher = self._watcher, None
+        if watcher is not None:
+            watcher.stop()
+
+    def _watcher_finished(self, watcher):
+        self._watchers.discard(watcher)
+        watcher.deleteLater()
+        if self._closing and not self._jobs and not self._watchers:
+            self.idle.emit()
+
+    def _watch_failed(self, error):
+        if self.sender() is not self._watcher or self._closing:
+            return
+        self.status.setText("文件监听失败")
+        self.status.setToolTip(error)
+
+    def _project_for_path(self, path: Path):
+        for root_key, state in sorted(
+            self.projects.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            try:
+                return root_key, state, path.relative_to(state.root).as_posix()
+            except ValueError:
+                continue
+        return None
+
+    def _file_changes(self, changes):
+        if self.sender() is not self._watcher or self._closing:
+            return
+        for change, value in changes:
+            match = self._project_for_path(Path(value))
+            if match is None:
+                continue
+            root_key, state, relative = match
+            if relative == ".":
+                safe = True
+            else:
+                safe = allowed_path(relative)
+            if not safe:
+                continue
+            update = self._pending_updates.setdefault(root_key, ProjectUpdate())
+            current = set(state.inventory.paths)
+            is_directory = Path(value).is_dir() or any(
+                path.startswith(relative.rstrip("/") + "/") for path in current
+            )
+            if (change in {Change.added, Change.deleted} or is_directory) and (
+                state.source_mode == "folder" or in_scope(relative, state.selection)
+            ):
+                update.rescan = True
+            affected = {
+                path
+                for path in current
+                if path == relative or path.startswith(relative.rstrip("/") + "/")
+            }
+            if in_scope(relative, state.selection):
+                affected.add(relative)
+            update.paths.update(
+                path for path in affected if in_scope(path, state.selection)
+            )
+            if not update.rescan and not update.paths:
+                self._pending_updates.pop(root_key, None)
+        if not self._pending_updates:
+            return
+        if self.index is None:
+            self._cancel_jobs()
+            self._revision += 1
+            self.status.setText("工作区变化，正在重新读取…")
+            self._debounce.start()
+            self._pending_updates.clear()
+            return
+        self._change_debounce.start()
+
+    def _apply_file_changes(self):
+        if self._closing or not self._pending_updates:
+            return
+        updates, self._pending_updates = self._pending_updates, {}
+        self.status.setText("已检测到文件变化 · 后台更新中")
+        self._start_index(updates)
+
+    def _start_index(self, updates=None):
         if self._closing or not self.projects:
             return
         self._cancel_jobs()
         self._revision += 1
         configs = tuple(
-            (state.root, state.selection, state.notes, state.source_mode)
+            (
+                state.root,
+                state.selection,
+                state.notes,
+                state.source_mode,
+                state.inventory,
+            )
             for state in self.projects.values()
         )
         job = IndexJob(
@@ -481,6 +658,7 @@ class WorkspacePanel(QWidget):
             configs,
             self.index or self._previous_index,
             self.store,
+            updates,
             self,
         )
         self._jobs.add(job)
@@ -492,7 +670,7 @@ class WorkspacePanel(QWidget):
     def _job_finished(self, job):
         self._jobs.discard(job)
         job.deleteLater()
-        if not self._jobs:
+        if not self._jobs and (not self._closing or not self._watchers):
             self.idle.emit()
 
     def _indexed(self, revision, inventories, index):
@@ -679,10 +857,6 @@ class WorkspacePanel(QWidget):
         elif path and path != "." and not path.endswith("/"):
             self.status.setText("勾选并索引后可预览文件")
 
-    def _poll(self):
-        if not self._jobs and not self._debounce.isActive():
-            self._start_index()
-
     def edit_notes(self):
         state = self._active_state() or next(iter(self.projects.values()), None)
         if state is None:
@@ -772,10 +946,14 @@ class WorkspacePanel(QWidget):
     def shutdown(self):
         self._closing = True
         self._debounce.stop()
-        self._refresh.stop()
+        self._change_debounce.stop()
+        self._pending_updates.clear()
         self._cancel_jobs()
+        for watcher in tuple(self._watchers):
+            watcher.stop()
+        self._watcher = None
         self._close_previews()
-        return not self._jobs
+        return not self._jobs and not self._watchers
 
     def _close_previews(self):
         for dialog in tuple(self._dialogs):

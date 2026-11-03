@@ -21,6 +21,8 @@ MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_FILES = 5000
 _EXCLUDED_DIRS = {
     ".git",
+    ".gradle",
+    ".idea",
     ".venv",
     "venv",
     "node_modules",
@@ -59,6 +61,9 @@ _BINARY_SUFFIXES = {
     ".safetensors",
     ".bin",
     ".sqlite",
+    ".sqlite3",
+    ".sqlite3-shm",
+    ".sqlite3-wal",
     ".db",
     ".woff",
     ".ttf",
@@ -131,6 +136,7 @@ def allowed_path(value: str) -> bool:
         and not any(p.lower().startswith(".env") for p in path.parts)
         and path.name.lower()
         not in {
+            ".ds_store",
             "credentials",
             "credentials.json",
             "id_rsa",
@@ -701,6 +707,7 @@ class RepositoryIndex:
         previous: "RepositoryIndex | None" = None,
         cancelled: threading.Event | None = None,
         store=None,
+        changed_paths: frozenset[str] | None = None,
     ) -> "RepositoryIndex":
         root = root.absolute()
         if root.resolve(strict=True) != root:
@@ -711,12 +718,25 @@ class RepositoryIndex:
         selected_paths = tuple(
             relative for relative in inventory.paths if in_scope(relative, selection)
         )
+        incremental = (
+            previous is not None and previous.root == root and changed_paths is not None
+        )
         stored = store.load(root, selected_paths) if store and previous is None else {}
         cache_hits = 0
         parsed_files = 0
         for relative in selected_paths:
             _cancelled(cancelled)
             try:
+                if incremental and relative not in changed_paths:
+                    old = previous.files.get(relative)
+                    if old is not None:
+                        total += len(old.text.encode())
+                        if total > MAX_TOTAL_BYTES:
+                            skipped.append(f"{relative}：超过总索引大小限制")
+                            continue
+                        files[relative] = old
+                        cache_hits += 1
+                        continue
                 signature = _source_signature(root, relative)
                 old = (
                     previous.files.get(relative)
@@ -744,7 +764,12 @@ class RepositoryIndex:
                 skipped.append(f"{relative}：{type(exc).__name__}")
         _cancelled(cancelled)
         if store is not None:
-            store.sync(root, files, cancelled)
+            store.sync(
+                root,
+                files,
+                cancelled,
+                changed_paths=changed_paths if incremental else None,
+            )
         return cls(
             root,
             selection,

@@ -38,7 +38,7 @@ def panel(tmp_path):
     )
     yield app, view
     view.shutdown()
-    wait(app, lambda: not view._jobs)
+    wait(app, lambda: not view._jobs and not view._watchers)
     view.close()
 
 
@@ -79,7 +79,7 @@ def test_folder_selection_is_partial_and_restores_per_project(panel, tmp_path):
     assert set(view.index.child(root).files) == {"src/cache.py"}
 
 
-def test_selected_folder_includes_new_files_after_background_refresh(panel, tmp_path):
+def test_selected_folder_includes_new_files_after_native_event(panel, tmp_path):
     app, view = panel
     root = tmp_path / "project"
     root.mkdir()
@@ -90,8 +90,6 @@ def test_selected_folder_includes_new_files_after_background_refresh(panel, tmp_
     wait(app, lambda: view.index is not None and bool(view.index.files))
     assert view.selection == (".",)
     (root / "two.py").write_text("def two(): pass\n")
-    wait(app, lambda: not view._jobs)
-    view._poll()
     wait(app, lambda: "two.py" in view.index.child(root).files)
     assert item(view, "two.py").checkState(0) == Qt.CheckState.Checked
     assert view.selection == (".",)
@@ -114,7 +112,93 @@ def test_close_cancels_index_and_leaves_no_background_qthread(
     wait(app, entered.is_set)
     assert not view.shutdown()
     wait(app, lambda: not view._jobs)
-    assert not view._refresh.isActive()
+    wait(app, lambda: not view._watchers)
+
+
+def test_modifying_one_file_does_not_rescan_and_only_reparses_that_file(
+    panel, tmp_path, monkeypatch
+):
+    app, view = panel
+    root = tmp_path / "project"
+    root.mkdir()
+    for number in range(40):
+        (root / f"module_{number}.py").write_text(
+            f"def value_{number}(): return {number}\n"
+        )
+    view.open_project(root)
+    wait(app, lambda: view.index is not None)
+    item(view, ".").setCheckState(0, Qt.CheckState.Checked)
+    wait(app, lambda: view.index is not None and len(view.index.files) == 40)
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError("an existing-file modification must not rescan the tree")
+
+    monkeypatch.setattr(module, "scan_repository", unexpected_scan)
+    changed = root / "module_17.py"
+    changed.write_text("def value_17(): return 1700\n")
+    wait(
+        app,
+        lambda: (
+            view.index is not None
+            and "1700" in view.index.child(root).files["module_17.py"].text
+        ),
+    )
+    child = view.index.child(root)
+    assert child.parsed_files == 1
+    assert child.cache_hits == 39
+
+
+def test_rename_and_delete_are_batched_into_one_inventory_refresh(panel, tmp_path):
+    app, view = panel
+    root = tmp_path / "project"
+    root.mkdir()
+    first = root / "first.py"
+    second = root / "second.py"
+    first.write_text("def first(): pass\n")
+    second.write_text("def second(): pass\n")
+    view.open_project(root)
+    wait(app, lambda: view.index is not None)
+    item(view, ".").setCheckState(0, Qt.CheckState.Checked)
+    wait(app, lambda: view.index is not None and len(view.index.files) == 2)
+
+    first.rename(root / "renamed.py")
+    second.unlink()
+    wait(
+        app,
+        lambda: (
+            view.index is not None
+            and set(view.index.child(root).files) == {"renamed.py"}
+        ),
+    )
+    assert item(view, "renamed.py").checkState(0) == Qt.CheckState.Checked
+
+
+def test_file_event_updates_only_the_changed_project(panel, tmp_path):
+    app, view = panel
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "one.py").write_text("def one(): return 1\n")
+    changed = second / "two.py"
+    changed.write_text("def two(): return 2\n")
+    view.open_project(first)
+    wait(app, lambda: view.index is not None)
+    item(view, ".", first).setCheckState(0, Qt.CheckState.Checked)
+    wait(app, lambda: view.index is not None and bool(view.index.child(first).files))
+    view.add_project(second)
+    wait(app, lambda: view.index is not None and len(view.projects) == 2)
+    item(view, ".", second).setCheckState(0, Qt.CheckState.Checked)
+    wait(app, lambda: view.index is not None and bool(view.index.child(second).files))
+    untouched = view.index.child(first)
+
+    changed.write_text("def two(): return 200\n")
+    wait(
+        app,
+        lambda: "200" in view.index.child(second).files["two.py"].text,
+    )
+    assert view.index.child(first) is untouched
+    assert view.index.child(second).parsed_files == 1
 
 
 def test_old_project_results_and_identical_file_references_cannot_leak(panel, tmp_path):
@@ -247,5 +331,5 @@ def test_all_appended_roots_restore_together(panel, tmp_path):
     assert restored.index.child(first).files
     assert restored.index.child(second).files
     restored.shutdown()
-    wait(app, lambda: not restored._jobs)
+    wait(app, lambda: not restored._jobs and not restored._watchers)
     restored.close()
