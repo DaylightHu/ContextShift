@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from contextshift.llm import ModelProvider, ModelRequest
+from contextshift.llm.base import ProviderOutputLimit
 from contextshift.runtime import (
     LimitReason,
     ResponseLimiter,
@@ -27,7 +28,7 @@ class TurnDelta:
     text: str
 
 
-TurnFinishReason = Literal["completed", "local_limit", "interrupted"]
+TurnFinishReason = Literal["completed", "local_limit", "provider_limit", "interrupted"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,28 +96,35 @@ class Session:
                 if not self._turn_controller.is_current(turn_id):
                     return TurnResult(turn_id, "interrupted", 0)
                 stream = self._provider.stream(resolved)
-                async for text in stream:
-                    if not self._turn_controller.is_current(turn_id):
-                        return TurnResult(
-                            turn_id=turn_id,
-                            finish_reason="interrupted",
-                            output_characters=limiter.characters,
-                        )
+                try:
+                    async for text in stream:
+                        if not self._turn_controller.is_current(turn_id):
+                            return TurnResult(
+                                turn_id=turn_id,
+                                finish_reason="interrupted",
+                                output_characters=limiter.characters,
+                            )
 
-                    limited = limiter.push(text)
+                        limited = limiter.push(text)
 
-                    # Keep the current-turn check, limiting, and rendering
-                    # synchronous so a new turn cannot be scheduled between them.
-                    if limited.text:
-                        on_delta(TurnDelta(turn_id=turn_id, text=limited.text))
+                        # Keep the current-turn check, limiting, and rendering
+                        # synchronous so a new turn cannot be scheduled between them.
+                        if limited.text:
+                            on_delta(TurnDelta(turn_id=turn_id, text=limited.text))
 
-                    if limited.reached_limit:
-                        return TurnResult(
-                            turn_id=turn_id,
-                            finish_reason="local_limit",
-                            output_characters=limiter.characters,
-                            limit_reason=limited.reason,
-                        )
+                        if limited.reached_limit:
+                            return TurnResult(
+                                turn_id=turn_id,
+                                finish_reason="local_limit",
+                                output_characters=limiter.characters,
+                                limit_reason=limited.reason,
+                            )
+                except ProviderOutputLimit:
+                    return TurnResult(
+                        turn_id=turn_id,
+                        finish_reason="provider_limit",
+                        output_characters=limiter.characters,
+                    )
 
                 return TurnResult(
                     turn_id=turn_id,

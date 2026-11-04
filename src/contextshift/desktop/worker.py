@@ -314,7 +314,10 @@ class AssistantWorker(QThread):
             self.sources.emit(self._epoch, core_references[:3], retrieval_seconds)
             self.response_finished.emit(
                 self._epoch,
-                "本地截断" if result.finish_reason == "local_limit" else "已完成",
+                {
+                    "local_limit": "本地截断",
+                    "provider_limit": "云端截断",
+                }.get(result.finish_reason, "已完成"),
             )
             if options.test_mode and request_started is not None:
                 self.metrics.emit(

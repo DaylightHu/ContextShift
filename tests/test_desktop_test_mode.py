@@ -16,7 +16,7 @@ pytest.importorskip("PySide6.QtWidgets")
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QInputMethodEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPlainTextEdit
+from PySide6.QtWidgets import QApplication
 
 from contextshift.desktop import worker as worker_module
 from contextshift.desktop.window import MainWindow
@@ -120,7 +120,10 @@ def test_project_followups_use_code_and_true_speech_without_an_extra_session(
     window,
     runtime,
     tmp_path,
+    monkeypatch,
 ):
+    opened = []
+    monkeypatch.setattr(window.workspace, "open_source_in_vscode", opened.append)
     root = tmp_path / "demo-project"
     root.mkdir()
     (root / "cache.py").write_text(
@@ -158,9 +161,9 @@ def test_project_followups_use_code_and_true_speech_without_an_extra_session(
     assert source_buttons
     assert len(source_buttons) <= 3
     source_buttons[0].click()
-    assert window.workspace._dialogs
-    editor = window.workspace._dialogs[-1].findChild(QPlainTextEdit)
-    assert editor.isReadOnly() and "previous_cache" in editor.toPlainText()
+    reply = window.feed.messages[-1]
+    QTest.mouseClick(reply.body.viewport(), Qt.MouseButton.LeftButton)
+    assert opened == [reply._references[0], reply._references[0]]
 
 
 def test_switching_projects_keeps_dialogue_but_revokes_old_code_and_source_links(

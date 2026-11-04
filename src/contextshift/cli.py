@@ -97,6 +97,8 @@ async def run_smoke_test(prompt: str) -> None:
             "[dim]finish_reason=local_limit "
             f"limit_reason={turn_result.limit_reason}[/dim]"
         )
+    elif turn_result.finish_reason == "provider_limit":
+        console.print("[dim]finish_reason=provider_limit[/dim]")
 
 
 async def run_benchmark_command(prompt: str, runs: int) -> None:

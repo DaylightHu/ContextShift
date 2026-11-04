@@ -14,6 +14,10 @@ class ModelRequest:
     query: str = ""
 
 
+class ProviderOutputLimit(Exception):
+    """The provider exhausted its output budget after continuation attempts."""
+
+
 class ModelProvider(Protocol):
     """Stream text deltas from a model and release provider resources."""
 

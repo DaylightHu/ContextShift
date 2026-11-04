@@ -88,6 +88,10 @@ async def run_interactive(
                 console.print(
                     f"\n[dim][Turn {turn.turn_id} stopped: {result.limit_reason}][/dim]"
                 )
+            elif not shutting_down and result.finish_reason == "provider_limit":
+                console.print(
+                    f"\n[dim][Turn {turn.turn_id} cloud output truncated][/dim]"
+                )
             elif not shutting_down:
                 console.print(f"\n[dim][Turn {turn.turn_id} completed][/dim]")
         finally:

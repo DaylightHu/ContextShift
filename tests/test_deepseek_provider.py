@@ -10,12 +10,14 @@ from openai import AsyncOpenAI
 
 from contextshift.config import Settings
 from contextshift.llm import DeepSeekProvider, ModelRequest
+from contextshift.llm.base import ProviderOutputLimit
 
 
 @dataclass(frozen=True)
 class FakeEvent:
     type: str
     delta: str = ""
+    response: Any = None
 
 
 class FakeStream:
@@ -42,6 +44,7 @@ class FakeResponses:
             [
                 FakeEvent("response.created"),
                 FakeEvent("response.output_text.delta", "answer"),
+                FakeEvent("response.completed"),
             ]
         )
         self.streams.append(stream)
@@ -110,6 +113,80 @@ async def test_rejects_requests_after_close() -> None:
 
     with pytest.raises(RuntimeError, match="DeepSeekProvider is closed"):
         await anext(provider.stream(request))
+
+
+@pytest.mark.asyncio
+async def test_incomplete_answer_continues_with_larger_budget() -> None:
+    settings = Settings(
+        _env_file=None,
+        DEEPSEEK_API_KEY="test-key",
+        CONTEXTSHIFT_MAX_OUTPUT_TOKENS=128,
+    )
+    client = FakeClient()
+    events = iter(
+        [
+            [
+                FakeEvent("response.output_text.delta", "开头 ApiService.class"),
+                FakeEvent(
+                    "response.incomplete",
+                    response=SimpleNamespace(
+                        incomplete_details=SimpleNamespace(reason="max_output_tokens")
+                    ),
+                ),
+            ],
+            [
+                FakeEvent("response.output_text.delta", " 后继续完成。"),
+                FakeEvent("response.completed"),
+            ],
+        ]
+    )
+
+    async def create(**kwargs):
+        client.responses.calls.append(kwargs)
+        stream = FakeStream(next(events))
+        client.responses.streams.append(stream)
+        return stream
+
+    client.responses.create = create
+    provider = DeepSeekProvider(settings, client=cast(AsyncOpenAI, client))
+    output = [part async for part in provider.stream(ModelRequest("问题", "指令"))]
+    assert "".join(output) == "开头 ApiService.class 后继续完成。"
+    assert [call["max_output_tokens"] for call in client.responses.calls] == [128, 2048]
+    assert client.responses.calls[1]["input"][1] == {
+        "role": "assistant",
+        "content": "开头 ApiService.class",
+    }
+    assert all(stream.closed for stream in client.responses.streams)
+
+
+@pytest.mark.asyncio
+async def test_repeated_output_limit_is_not_reported_as_completion() -> None:
+    client = FakeClient()
+
+    async def create(**kwargs):
+        stream = FakeStream(
+            [
+                FakeEvent("response.output_text.delta", "片段"),
+                FakeEvent(
+                    "response.incomplete",
+                    response=SimpleNamespace(
+                        incomplete_details=SimpleNamespace(reason="max_output_tokens")
+                    ),
+                ),
+            ]
+        )
+        client.responses.streams.append(stream)
+        return stream
+
+    client.responses.create = create
+    provider = DeepSeekProvider(
+        Settings(_env_file=None, DEEPSEEK_API_KEY="test-key"),
+        client=cast(AsyncOpenAI, client),
+    )
+    with pytest.raises(ProviderOutputLimit):
+        _ = [part async for part in provider.stream(ModelRequest("问题", "指令"))]
+    assert len(client.responses.streams) == 3
+    assert all(stream.closed for stream in client.responses.streams)
 
 
 @pytest.mark.asyncio

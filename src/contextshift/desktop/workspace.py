@@ -2,6 +2,9 @@
 
 import hashlib
 import json
+import shutil
+import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -942,6 +945,45 @@ class WorkspacePanel(QWidget):
         )
         dialog.show()
         editor.centerCursor()
+
+    def open_source_in_vscode(self, reference: SourceReference) -> None:
+        """Open a verified, selected source at its indexed line in VS Code."""
+
+        if not self.index or self.index.file_for(reference) is None:
+            self.status.setText("来源已不在当前索引中")
+            return
+        root_path = (
+            Path(reference.workspace)
+            if reference.workspace
+            else self.index.indexes[0].root
+        )
+        root = root_path.resolve()
+        target = (root / reference.path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            self.status.setText("来源文件已移动或不可访问")
+            return
+
+        code = shutil.which("code") or shutil.which("code-insiders")
+        if code is None and sys.platform == "darwin":
+            for applications in (Path("/Applications"), Path.home() / "Applications"):
+                bundled = (
+                    applications
+                    / "Visual Studio Code.app/Contents/Resources/app/bin/code"
+                )
+                if bundled.is_file():
+                    code = str(bundled)
+                    break
+        if code is None:
+            self.status.setText("未找到 VS Code，请安装 code 命令")
+            return
+        try:
+            subprocess.Popen(
+                [code, "--goto", f"{target}:{max(1, reference.start_line)}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            self.status.setText("无法启动 VS Code")
 
     def shutdown(self):
         self._closing = True
