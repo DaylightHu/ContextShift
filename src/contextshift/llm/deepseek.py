@@ -4,8 +4,10 @@ from collections.abc import AsyncGenerator
 
 from openai import AsyncOpenAI
 
+from contextshift.code_explorer import CodeExplorer
 from contextshift.config import Settings
 from contextshift.llm.base import ModelRequest
+from contextshift.repository import RepositoryIndex, WorkspaceIndex
 
 
 class DeepSeekProvider:
@@ -54,6 +56,19 @@ class DeepSeekProvider:
                     yield event.delta
         finally:
             await stream.close()
+
+    async def explore_code(
+        self,
+        index: RepositoryIndex | WorkspaceIndex,
+        query: str,
+        dialogue: tuple[str, ...] = (),
+    ):
+        """Let the model search and read only selected workspace snapshots."""
+        if self._closed:
+            raise RuntimeError("DeepSeekProvider is closed")
+        return await CodeExplorer(index).explore(
+            self._client, model=self._settings.model, query=query, dialogue=dialogue
+        )
 
     async def close(self) -> None:
         """Close the reusable API client once."""

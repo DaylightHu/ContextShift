@@ -156,17 +156,21 @@ class AssistantWorker(QThread):
             else ()
         )
         cancelled = threading.Event()
-        try:
-            bundle = await asyncio.to_thread(
-                index.retrieve,
-                request.query,
-                dialogue=dialogue,
-                focus=self._code_focus,
-                active_file=self._active_file,
-                cancelled=cancelled,
-            )
-        finally:
-            cancelled.set()
+        explorer = getattr(self._provider, "explore_code", None)
+        if explorer is not None:
+            bundle = await explorer(index, request.query, dialogue)
+        else:
+            try:
+                bundle = await asyncio.to_thread(
+                    index.retrieve,
+                    request.query,
+                    dialogue=dialogue,
+                    focus=self._code_focus,
+                    active_file=self._active_file,
+                    cancelled=cancelled,
+                )
+            finally:
+                cancelled.set()
         if (
             self._stop_requested.is_set()
             or revision != self._repository_revision
@@ -270,6 +274,7 @@ class AssistantWorker(QThread):
         self._stop = asyncio.Event()
         options = self.options
         provider = DeepSeekProvider(options.settings)
+        self._provider = provider
         session = Session(provider, context_resolver=self._resolve_context)
         request_started: float | None = None
         first_token: float | None = None

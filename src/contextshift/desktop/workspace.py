@@ -186,7 +186,7 @@ class WorkspacePanel(QWidget):
             )
         )
         self.store = store or RepositoryStore(
-            cache_root / "repository-index-v1.sqlite3"
+            cache_root / "repository-index-v1-agentic.sqlite3"
         )
         self.projects: dict[str, ProjectState] = {}
         self.index: WorkspaceIndex | None = None
