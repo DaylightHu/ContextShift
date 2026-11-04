@@ -60,6 +60,7 @@ class FakeClient:
 @pytest.mark.asyncio
 async def test_reuses_client_and_closes_each_response_stream() -> None:
     settings = Settings(DEEPSEEK_API_KEY="test-key")
+    assert settings.max_output_tokens == 2048
     fake_client = FakeClient()
     provider = DeepSeekProvider(
         settings,
@@ -87,6 +88,13 @@ async def test_reuses_client_and_closes_each_response_stream() -> None:
         "max_output_tokens": settings.max_output_tokens,
         "stream": True,
     }
+
+
+def test_output_budget_can_be_raised_above_previous_ceiling() -> None:
+    settings = Settings(
+        DEEPSEEK_API_KEY="test-key", CONTEXTSHIFT_MAX_OUTPUT_TOKENS=4096
+    )
+    assert settings.max_output_tokens == 4096
 
 
 @pytest.mark.asyncio

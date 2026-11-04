@@ -6,8 +6,8 @@ from typing import Literal
 
 DialogueRole = Literal["user", "candidate", "interviewer"]
 _ROLE_LABELS = {"user": "用户", "candidate": "候选人", "interviewer": "面试官"}
-DEFAULT_HISTORY_MAX_TURNS = 64
-DEFAULT_HISTORY_MAX_CHARACTERS = 12_000
+DEFAULT_HISTORY_MAX_TURNS = 128
+DEFAULT_HISTORY_MAX_CHARACTERS = 48_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +92,7 @@ class DialogueHistory:
         current = (
             f"面试官问题：{question}\n\n"
             "任务：结合真实对话，直接写出候选人此刻可以说的回答要点。"
-            "不要写回答策略、表达建议或后续追问提示。只输出 1–3 行；"
+            "不要写回答策略、表达建议或后续追问提示。根据问题复杂度完整回答；"
             "不要虚构候选人的经历，也不要把模型内容当作已经说过的话。"
             if role == "interviewer"
             else f"当前问题：{question}"

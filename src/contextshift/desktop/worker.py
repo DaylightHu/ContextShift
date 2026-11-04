@@ -151,7 +151,7 @@ class AssistantWorker(QThread):
                 )
             return request
         dialogue = (
-            tuple(turn.text for turn in self._assistant.history.turns[-5:])
+            tuple(turn.text for turn in self._assistant.history.turns[-16:])
             if self._assistant
             else ()
         )

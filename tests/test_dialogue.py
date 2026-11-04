@@ -11,7 +11,7 @@ def test_interviewer_prompt_is_role_aware_even_without_history() -> None:
     prompt = history.build_model_input("介绍项目", role="interviewer")
     assert "面试官问题：介绍项目" in prompt
     assert "候选人" in prompt
-    assert "1–3 行" in prompt
+    assert "根据问题复杂度完整回答" in prompt
     assert history.entries == ()
 
 
@@ -74,8 +74,19 @@ def test_context_budget_matches_suffix_of_actual_dialogue(budget: int) -> None:
 
 def test_enlarged_defaults_still_bound_retained_turns() -> None:
     history = DialogueHistory()
-    for index in range(70):
+    for index in range(140):
         history.append(f"actual-{index}")
-    assert len(history) == 64
-    assert history.entries[0] == "actual-6"
-    assert history.entries[-1] == "actual-69"
+    assert len(history) == 128
+    assert history.entries[0] == "actual-12"
+    assert history.entries[-1] == "actual-139"
+
+
+def test_default_prompt_retains_earlier_real_speech_beyond_old_budget() -> None:
+    history = DialogueHistory()
+    history.append("开头的架构约定", role="candidate")
+    for _ in range(20):
+        history.append("后续真实对话" * 120, role="interviewer")
+
+    prompt = history.build_model_input("架构约定是什么？", role="interviewer")
+    assert "候选人：开头的架构约定" in prompt
+    assert len(prompt) > 12_000

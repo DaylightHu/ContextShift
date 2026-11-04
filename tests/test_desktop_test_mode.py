@@ -392,10 +392,8 @@ def test_cancelled_request_cleanup_error_cannot_fail_the_new_question(
     assert not any("请求失败" in m.text for m in window.feed.messages)
 
 
-@pytest.mark.parametrize(
-    "answer,reason", [("", "completed"), ("x" * 400, "local_limit")]
-)
-def test_metrics_and_limit_use_the_same_production_session(
+@pytest.mark.parametrize("answer,reason", [("", "completed"), ("x" * 400, "completed")])
+def test_metrics_and_long_answer_use_the_same_production_session(
     app, window, runtime, answer, reason
 ):
     async def stream(index, request):
@@ -412,8 +410,8 @@ def test_metrics_and_limit_use_the_same_production_session(
     assert result.elapsed_seconds >= 0
     if answer:
         assert 0 <= result.first_token_seconds <= result.elapsed_seconds
-        assert 0 < result.output_characters < len(answer)
-        assert "本地截断" in window.composer.details.text()
+        assert result.output_characters == len(answer)
+        assert "本地截断" not in window.composer.details.text()
     else:
         assert result.first_token_seconds is None and result.output_characters == 0
         assert "无文本输出" in window.composer.details.text()

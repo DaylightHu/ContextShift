@@ -6,6 +6,7 @@ import pytest
 
 from contextshift.code_explorer import CodeExplorer
 from contextshift.desktop.worker import AssistantWorker
+from contextshift.dialogue import DialogueHistory
 from contextshift.llm.base import ModelRequest
 from contextshift.repository import (
     ContextBundle,
@@ -114,3 +115,43 @@ async def test_worker_uses_model_exploration_when_available(tmp_path):
     assert calls == [(index, "question", ())]
     assert "Evidence from multiple tool calls" in request.input
     assert len(worker._turn_sources) == 1
+
+
+@pytest.mark.asyncio
+async def test_explorer_receives_more_recent_actual_utterances(tmp_path):
+    index = RepositoryIndex(tmp_path, (), "", {})
+    explorer = CodeExplorer(index)
+    requests = []
+
+    async def create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(output=[], output_text="done")
+
+    dialogue = tuple(f"utterance-{n}" for n in range(20))
+    api = SimpleNamespace(responses=SimpleNamespace(create=create))
+    await explorer.explore(api, model="test-model", query="current", dialogue=dialogue)
+    input_text = requests[0]["input"][0]["content"]
+    assert "utterance-4" in input_text
+    assert "utterance-3" not in input_text
+    assert "utterance-19" in input_text
+    assert "Recent actual utterances" in input_text
+
+
+@pytest.mark.asyncio
+async def test_worker_forwards_sixteen_recent_utterances_to_explorer(tmp_path):
+    index = RepositoryIndex(tmp_path, (), "", {})
+    history = DialogueHistory()
+    for n in range(20):
+        history.append(f"turn-{n}")
+    worker = AssistantWorker(SimpleNamespace())
+    worker._repository = index
+    worker._assistant = SimpleNamespace(history=history)
+    forwarded = []
+
+    async def explore(scope, query, dialogue):
+        forwarded.extend(dialogue)
+        return ContextBundle("evidence", (), 0.0)
+
+    worker._provider = SimpleNamespace(explore_code=explore)
+    await worker._resolve_context(ModelRequest("input", "instruction", "question"))
+    assert forwarded == [f"turn-{n}" for n in range(4, 20)]

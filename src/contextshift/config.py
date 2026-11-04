@@ -32,9 +32,9 @@ class Settings(BaseSettings):
         validation_alias="CONTEXTSHIFT_REASONING_EFFORT",
     )
     max_output_tokens: int = Field(
-        default=64,
+        default=2048,
         ge=1,
-        le=256,
+        le=8192,
         validation_alias="CONTEXTSHIFT_MAX_OUTPUT_TOKENS",
     )
     history_max_turns: int = Field(

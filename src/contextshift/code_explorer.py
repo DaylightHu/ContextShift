@@ -56,6 +56,8 @@ TOOLS = [
     },
 ]
 
+RECENT_DIALOGUE_MAX_CHARACTERS = 12_000
+
 
 @dataclass(frozen=True)
 class _File:
@@ -146,11 +148,12 @@ class CodeExplorer:
         self, client, *, model: str, query: str, dialogue: tuple[str, ...] = ()
     ) -> ContextBundle:
         started = perf_counter()
+        recent_dialogue = "\n".join(dialogue[-16:])[-RECENT_DIALOGUE_MAX_CHARACTERS:]
         history: list[dict] = [
             {
                 "role": "user",
-                "content": "Recent questions: "
-                + " | ".join(dialogue[-3:])
+                "content": "Recent actual utterances: "
+                + recent_dialogue
                 + "\nCurrent question: "
                 + query,
             }
@@ -172,7 +175,7 @@ class CodeExplorer:
                 tools=TOOLS,
                 tool_choice="auto" if step < 15 else "none",
                 reasoning={"effort": "none"},
-                max_output_tokens=1200,
+                max_output_tokens=2048,
             )
             calls = []
             for item in response.output:
@@ -222,7 +225,7 @@ class CodeExplorer:
         text = (
             "<verified_code_exploration>\n"
             + "Code exploration draft (verify against numbered excerpts): "
-            + answer[:4000]
+            + answer
             + "\n"
             + "\n\n".join(self.excerpts[:24])
             + "\n</verified_code_exploration>"
