@@ -188,7 +188,9 @@ class MainWindow(QMainWindow):
         if self._closing or not self._ready or epoch != self._active_epoch:
             return
         if references:
-            self._ensure_reply().set_sources(references, self.workspace.open_source)
+            self._ensure_reply().set_sources(
+                references, self.workspace.open_source_in_vscode
+            )
         if self.composer is not None:
             self.composer.details.setText(
                 f"{self.worker.options.settings.model} · 检索 {elapsed:.3f}s · {len(references)} 处来源"
@@ -470,7 +472,10 @@ class MainWindow(QMainWindow):
             if metrics.first_token_seconds is not None
             else "无文本输出"
         )
-        finish = "本地截断" if metrics.finish_reason == "local_limit" else "完成"
+        finish = {
+            "local_limit": "本地截断",
+            "provider_limit": "云端截断",
+        }.get(metrics.finish_reason, "完成")
         self.composer.details.setText(
             f"{self.worker.options.settings.model} · {first} · "
             f"{metrics.elapsed_seconds:.2f}s · {finish}"

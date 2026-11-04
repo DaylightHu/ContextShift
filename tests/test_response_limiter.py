@@ -5,6 +5,16 @@ import pytest
 from contextshift.runtime import ResponseLimiter, ResponseLimits
 
 
+def test_default_accepts_multiline_answer_without_local_truncation() -> None:
+    limiter = ResponseLimiter()
+    answer = ("入口调用接口。接口指向端点。服务执行查询。\n" * 12) + "结果返回客户端。"
+    result = limiter.push(answer)
+
+    assert result.text == answer
+    assert not result.reached_limit
+    assert limiter.characters == len(answer)
+
+
 def test_character_limit_truncates_across_deltas() -> None:
     limiter = ResponseLimiter(
         ResponseLimits(

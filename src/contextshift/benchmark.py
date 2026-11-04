@@ -12,6 +12,7 @@ from contextshift.session import Session, TurnDelta
 BenchmarkFinishReason = Literal[
     "completed",
     "local_limit",
+    "provider_limit",
     "empty_response",
     "error",
 ]
@@ -136,6 +137,8 @@ async def run_latency_benchmark(
             if turn_result.finish_reason == "local_limit":
                 finish_reason = "local_limit"
                 limit_reason = turn_result.limit_reason
+            elif turn_result.finish_reason == "provider_limit":
+                finish_reason = "provider_limit"
         except Exception as exc:  # noqa: BLE001 - each failed run must be recorded
             error = f"{type(exc).__name__}: {exc}"
             finish_reason = "error"

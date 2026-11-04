@@ -12,12 +12,20 @@ import pytest
 
 pytest.importorskip("PySide6.QtWidgets")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
 
 from contextshift.desktop import worker as worker_module
+from contextshift.desktop import workspace as workspace_module
 from contextshift.desktop.chat import Avatar, ChatFeed
 from contextshift.desktop.window import MainWindow
+from contextshift.repository import (
+    RepositoryIndex,
+    SourceFile,
+    SourceReference,
+    WorkspaceIndex,
+)
 from contextshift.speech.events import SpeechStarted, TranscriptReady
 
 
@@ -153,6 +161,48 @@ def test_main_window_contains_only_icons_and_message_content(window):
         "ai",
     ]
     assert not hasattr(window, "question")
+
+
+def test_answer_and_source_links_open_verified_file_in_vscode(
+    application, window, tmp_path, monkeypatch
+):
+    source = tmp_path / "src" / "ApiService.java"
+    source.parent.mkdir()
+    source.write_text("line one\nline two\n")
+    reference = SourceReference(
+        "src/ApiService.java", 2, 2, "ApiService", "digest", str(tmp_path)
+    )
+    indexed_file = SourceFile(
+        reference.path, source.read_text(), (0, 0, 0), "digest", (), ()
+    )
+    window.workspace.index = WorkspaceIndex(
+        (RepositoryIndex(tmp_path, (), "", {reference.path: indexed_file}),)
+    )
+    commands = []
+    monkeypatch.setattr(workspace_module.shutil, "which", lambda name: "/usr/bin/code")
+    monkeypatch.setattr(
+        workspace_module.subprocess,
+        "Popen",
+        lambda argv, **kwargs: commands.append(argv),
+    )
+    window._ready = True
+    window.show()
+    window._response_started(1)
+    window._response(1, "ApiService 的处理入口")
+    window._sources_ready(1, (reference,), 0.1)
+    reply = window.feed.messages[-1]
+    settle(application)
+    QTest.mouseClick(reply.body.viewport(), Qt.MouseButton.LeftButton)
+    reply.sources.findChildren(QPushButton)[0].click()
+    assert commands == [
+        ["/usr/bin/code", "--goto", f"{source}:2"],
+        ["/usr/bin/code", "--goto", f"{source}:2"],
+    ]
+
+    outside = SourceReference("../outside.java", 1, 1, "", "digest", str(tmp_path))
+    window.workspace.open_source_in_vscode(outside)
+    assert len(commands) == 2
+    assert "不在当前索引" in window.workspace.status.text()
     assert not hasattr(window, "start_button")
 
 

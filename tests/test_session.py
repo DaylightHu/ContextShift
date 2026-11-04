@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 import pytest
 
 from contextshift.llm import ModelRequest
+from contextshift.llm.base import ProviderOutputLimit
 from contextshift.runtime import ResponseLimits
 from contextshift.session import Session, TurnDelta
 
@@ -159,3 +160,24 @@ async def test_local_limit_stops_rendering_and_closes_provider_stream() -> None:
 
     await session.close()
     assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_provider_output_limit_keeps_partial_text_and_reports_truncation() -> (
+    None
+):
+    class Provider:
+        async def stream(self, request):
+            yield "尚未结束的回答"
+            raise ProviderOutputLimit("cloud limit")
+
+        async def close(self):
+            pass
+
+    session = Session(Provider())
+    rendered = []
+    _, task = session.submit("问题", rendered.append)
+    result = await task
+    assert result.finish_reason == "provider_limit"
+    assert "".join(delta.text for delta in rendered) == "尚未结束的回答"
+    await session.close()

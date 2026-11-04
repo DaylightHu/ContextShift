@@ -16,7 +16,7 @@ pytest.importorskip("PySide6.QtWidgets")
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QInputMethodEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPlainTextEdit
+from PySide6.QtWidgets import QApplication
 
 from contextshift.desktop import worker as worker_module
 from contextshift.desktop.window import MainWindow
@@ -120,7 +120,10 @@ def test_project_followups_use_code_and_true_speech_without_an_extra_session(
     window,
     runtime,
     tmp_path,
+    monkeypatch,
 ):
+    opened = []
+    monkeypatch.setattr(window.workspace, "open_source_in_vscode", opened.append)
     root = tmp_path / "demo-project"
     root.mkdir()
     (root / "cache.py").write_text(
@@ -158,9 +161,9 @@ def test_project_followups_use_code_and_true_speech_without_an_extra_session(
     assert source_buttons
     assert len(source_buttons) <= 3
     source_buttons[0].click()
-    assert window.workspace._dialogs
-    editor = window.workspace._dialogs[-1].findChild(QPlainTextEdit)
-    assert editor.isReadOnly() and "previous_cache" in editor.toPlainText()
+    reply = window.feed.messages[-1]
+    QTest.mouseClick(reply.body.viewport(), Qt.MouseButton.LeftButton)
+    assert opened == [reply._references[0], reply._references[0]]
 
 
 def test_switching_projects_keeps_dialogue_but_revokes_old_code_and_source_links(
@@ -392,10 +395,8 @@ def test_cancelled_request_cleanup_error_cannot_fail_the_new_question(
     assert not any("请求失败" in m.text for m in window.feed.messages)
 
 
-@pytest.mark.parametrize(
-    "answer,reason", [("", "completed"), ("x" * 400, "local_limit")]
-)
-def test_metrics_and_limit_use_the_same_production_session(
+@pytest.mark.parametrize("answer,reason", [("", "completed"), ("x" * 400, "completed")])
+def test_metrics_and_long_answer_use_the_same_production_session(
     app, window, runtime, answer, reason
 ):
     async def stream(index, request):
@@ -412,8 +413,8 @@ def test_metrics_and_limit_use_the_same_production_session(
     assert result.elapsed_seconds >= 0
     if answer:
         assert 0 <= result.first_token_seconds <= result.elapsed_seconds
-        assert 0 < result.output_characters < len(answer)
-        assert "本地截断" in window.composer.details.text()
+        assert result.output_characters == len(answer)
+        assert "本地截断" not in window.composer.details.text()
     else:
         assert result.first_token_seconds is None and result.output_characters == 0
         assert "无文本输出" in window.composer.details.text()

@@ -151,22 +151,26 @@ class AssistantWorker(QThread):
                 )
             return request
         dialogue = (
-            tuple(turn.text for turn in self._assistant.history.turns[-5:])
+            tuple(turn.text for turn in self._assistant.history.turns[-16:])
             if self._assistant
             else ()
         )
         cancelled = threading.Event()
-        try:
-            bundle = await asyncio.to_thread(
-                index.retrieve,
-                request.query,
-                dialogue=dialogue,
-                focus=self._code_focus,
-                active_file=self._active_file,
-                cancelled=cancelled,
-            )
-        finally:
-            cancelled.set()
+        explorer = getattr(self._provider, "explore_code", None)
+        if explorer is not None:
+            bundle = await explorer(index, request.query, dialogue)
+        else:
+            try:
+                bundle = await asyncio.to_thread(
+                    index.retrieve,
+                    request.query,
+                    dialogue=dialogue,
+                    focus=self._code_focus,
+                    active_file=self._active_file,
+                    cancelled=cancelled,
+                )
+            finally:
+                cancelled.set()
         if (
             self._stop_requested.is_set()
             or revision != self._repository_revision
@@ -270,6 +274,7 @@ class AssistantWorker(QThread):
         self._stop = asyncio.Event()
         options = self.options
         provider = DeepSeekProvider(options.settings)
+        self._provider = provider
         session = Session(provider, context_resolver=self._resolve_context)
         request_started: float | None = None
         first_token: float | None = None
@@ -309,7 +314,10 @@ class AssistantWorker(QThread):
             self.sources.emit(self._epoch, core_references[:3], retrieval_seconds)
             self.response_finished.emit(
                 self._epoch,
-                "本地截断" if result.finish_reason == "local_limit" else "已完成",
+                {
+                    "local_limit": "本地截断",
+                    "provider_limit": "云端截断",
+                }.get(result.finish_reason, "已完成"),
             )
             if options.test_mode and request_started is not None:
                 self.metrics.emit(

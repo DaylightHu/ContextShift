@@ -16,9 +16,9 @@ IMMEDIATE_SENTENCE_TERMINATORS = frozenset("。!?！？")
 class ResponseLimits:
     """Maximum rendered size for one model response."""
 
-    max_lines: int = 3
-    max_characters: int = 240
-    max_complete_sentences: int = 3
+    max_lines: int | None = None
+    max_characters: int | None = None
+    max_complete_sentences: int | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -26,7 +26,8 @@ class ResponseLimits:
             "max_characters",
             "max_complete_sentences",
         ):
-            if getattr(self, field_name) < 1:
+            value = getattr(self, field_name)
+            if value is not None and value < 1:
                 raise ValueError(f"{field_name} must be at least 1")
 
 
@@ -83,7 +84,11 @@ class ResponseLimiter:
             if self._pending_ascii_period and character != ".":
                 if character.isspace():
                     self._complete_sentences += 1
-                    if self._complete_sentences >= self._limits.max_complete_sentences:
+                    if (
+                        self._limits.max_complete_sentences is not None
+                        and self._complete_sentences
+                        >= self._limits.max_complete_sentences
+                    ):
                         self._pending_ascii_period = False
                         return self._stop(
                             accepted,
@@ -91,7 +96,11 @@ class ResponseLimiter:
                         )
                 self._pending_ascii_period = False
 
-            if character == "\n" and self._lines >= self._limits.max_lines:
+            if (
+                character == "\n"
+                and self._limits.max_lines is not None
+                and self._lines >= self._limits.max_lines
+            ):
                 return self._stop(accepted, "max_lines")
 
             accepted.append(character)
@@ -110,10 +119,16 @@ class ResponseLimiter:
             else:
                 self._in_terminator_run = False
 
-            if self._complete_sentences >= self._limits.max_complete_sentences:
+            if (
+                self._limits.max_complete_sentences is not None
+                and self._complete_sentences >= self._limits.max_complete_sentences
+            ):
                 return self._stop(accepted, "max_complete_sentences")
 
-            if self._characters >= self._limits.max_characters:
+            if (
+                self._limits.max_characters is not None
+                and self._characters >= self._limits.max_characters
+            ):
                 return self._stop(accepted, "max_characters")
 
         return LimitedChunk(text="".join(accepted), reached_limit=False)

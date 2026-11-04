@@ -202,6 +202,8 @@ class Avatar(QWidget):
 class MessageText(QTextBrowser):
     """Grow with content and wrap even long paths and unbroken identifiers."""
 
+    clicked = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("message")
@@ -228,6 +230,14 @@ class MessageText(QTextBrowser):
 
     def setText(self, text: str) -> None:
         self.setPlainText(text)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self.textCursor().hasSelection()
+        ):
+            self.clicked.emit()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -269,6 +279,9 @@ class ChatMessage(QWidget):
         column.setSpacing(7)
         self.setAccessibleName(title or ROLES[role].title)
         self.body = MessageText()
+        self.body.clicked.connect(self._open_primary_source)
+        self._references = ()
+        self._open_source = None
         column.addWidget(self.body)
         self.sources = QWidget()
         self._source_layout = QGridLayout(self.sources)
@@ -281,6 +294,11 @@ class ChatMessage(QWidget):
         self.set_text(text)
 
     def set_sources(self, references, open_source):
+        self._references = tuple(references)
+        self._open_source = open_source
+        if self.role == "ai" and self._references:
+            self.body.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.body.setToolTip("点击回答打开主要来源；点击下方来源定位具体代码")
         while self._source_layout.count():
             item = self._source_layout.takeAt(0)
             item.widget().deleteLater()
@@ -308,6 +326,10 @@ class ChatMessage(QWidget):
             self._source_layout.addWidget(button, i // 2, i % 2)
         self.sources.setVisible(bool(references))
         self.changed.emit()
+
+    def _open_primary_source(self) -> None:
+        if self.role == "ai" and self._references and self._open_source is not None:
+            self._open_source(self._references[0])
 
     @property
     def pinned(self) -> bool:
