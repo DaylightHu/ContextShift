@@ -1,6 +1,7 @@
 """A listening window appears only after the full startup barrier is met."""
 
 from pathlib import Path
+from time import perf_counter
 
 from pydantic import ValidationError
 from PySide6.QtCore import QSettings, Qt, QTimer, Signal
@@ -12,10 +13,12 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QSplitter,
     QToolButton,
@@ -28,6 +31,7 @@ from contextshift.desktop.app import project_directory
 from contextshift.desktop.chat import Avatar, ChatFeed, ChatMessage, TestComposer
 from contextshift.desktop.worker import AssistantWorker, DesktopOptions, ReplyMetrics
 from contextshift.desktop.workspace import WorkspacePanel
+from contextshift.semantic_index import SemanticProgress
 from contextshift.speech.audio import list_input_devices
 
 _STYLE = """
@@ -60,6 +64,10 @@ QTreeWidget::item { padding: 5px 2px; }
 QTreeWidget::item:selected { background: #263447; }
 QLabel#workspaceStatus { color: #8793ae; font-size: 11px; }
 QLabel#workspaceTitle { color: #cad3f5; font-weight: 600; }
+QFrame#activityPanel { background: #1b2030; border: 1px solid #343c52; border-radius: 8px; }
+QLabel#activityText { color: #b7c2d9; font-size: 11px; }
+QProgressBar#activityProgress { border: none; background: #30384b; border-radius: 3px; max-height: 5px; min-height: 5px; }
+QProgressBar#activityProgress::chunk { background: #8bd5ca; border-radius: 3px; }
 QSplitter::handle { background: #252d3c; width: 1px; }
 QPushButton#sourceLink { color: #8bd5ca; background: transparent; border: none; padding: 2px; font-size: 11px; text-align: left; }
 """
@@ -150,6 +158,29 @@ class MainWindow(QMainWindow):
         self._chat_layout.setContentsMargins(0, 0, 0, 0)
         self.feed = ChatFeed()
         self._chat_layout.addWidget(self.feed, 1)
+        self.activity = QFrame()
+        self.activity.setObjectName("activityPanel")
+        activity_layout = QVBoxLayout(self.activity)
+        activity_layout.setContentsMargins(12, 7, 12, 7)
+        activity_layout.setSpacing(3)
+        self.index_activity = QLabel("本地向量索引：等待工作区")
+        self.answer_activity = QLabel("回答：等待提问")
+        for label in (self.index_activity, self.answer_activity):
+            label.setObjectName("activityText")
+            activity_layout.addWidget(label)
+        self.index_progress = QProgressBar()
+        self.index_progress.setObjectName("activityProgress")
+        self.index_progress.setTextVisible(False)
+        self.index_progress.hide()
+        activity_layout.addWidget(self.index_progress)
+        self._chat_layout.addWidget(self.activity)
+        self._index_text = "本地向量索引：等待工作区"
+        self._answer_text = "回答：等待提问"
+        self._index_started: float | None = None
+        self._answer_started: float | None = None
+        self._activity_timer = QTimer(self)
+        self._activity_timer.timeout.connect(self._refresh_activity)
+        self._activity_timer.start(1000)
         self.splitter.addWidget(chat)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([260, 900])
@@ -421,6 +452,8 @@ class MainWindow(QMainWindow):
         worker.request_failed.connect(current(self._request_failed))
         worker.metrics.connect(current(self._metrics))
         worker.sources.connect(current(self._sources_ready))
+        worker.semantic_progress.connect(current(self._semantic_progress))
+        worker.turn_progress.connect(current(self._turn_progress))
         worker.finished.connect(current(self._worker_finished))
         self._save_preferences()
         worker.start()
@@ -496,6 +529,47 @@ class MainWindow(QMainWindow):
             self.loading.message.setText(text)
             self.state.setToolTip(text)
 
+    def _refresh_activity(self) -> None:
+        def display(text: str, started: float | None) -> str:
+            return f"{text} · {perf_counter() - started:.0f}s" if started else text
+
+        self.index_activity.setText(display(self._index_text, self._index_started))
+        self.answer_activity.setText(display(self._answer_text, self._answer_started))
+
+    def _semantic_progress(self, progress: SemanticProgress) -> None:
+        if self._closing:
+            return
+        device = f" · {progress.device.upper()}" if progress.device else ""
+        stages = {
+            "unavailable": "模型未找到，使用现有检索",
+            "waiting": "等待工作区",
+            "queued": "等待后台建索引",
+            "scanning": "正在统计已选代码片段",
+            "comparing": "正在核对已有向量",
+            "loading": "正在加载本地模型",
+            "encoding": f"正在编码 {progress.completed}/{progress.total} 片段（复用 {progress.reused}）",
+            "cleaning": "正在清理旧片段",
+            "ready": f"已就绪 · {progress.total} 片段（复用 {progress.reused}）",
+            "failed": "建索引失败，使用现有检索（详见终端）",
+        }
+        self._index_text = "本地向量索引：" + stages[progress.stage] + device
+        if progress.stage in {"queued", "scanning"}:
+            self._index_started = perf_counter()
+        elif progress.stage in {"ready", "failed", "unavailable", "waiting"}:
+            self._index_started = None
+        if progress.stage == "encoding" and progress.total:
+            self.index_progress.setRange(0, progress.total)
+            self.index_progress.setValue(progress.completed)
+            self.index_progress.show()
+        else:
+            self.index_progress.hide()
+        self._refresh_activity()
+
+    def _turn_progress(self, epoch: int, stage: str) -> None:
+        if not self._closing and self._ready and epoch == self._active_epoch:
+            self._answer_text = "回答：" + stage
+            self._refresh_activity()
+
     def _open_settings(self) -> None:
         if self.worker is not None:
             self.test_mode.setChecked(self.worker.options.test_mode)
@@ -535,6 +609,9 @@ class MainWindow(QMainWindow):
         self._end_reply("已中断")
         self._active_epoch = epoch
         self._active_message = None
+        self._answer_started = perf_counter()
+        self._answer_text = "回答：正在准备问题与代码上下文…"
+        self._refresh_activity()
         if self.composer is not None and self.worker is not None:
             self.composer.details.setText(
                 f"{self.worker.options.settings.model} · 生成中…"
@@ -547,11 +624,17 @@ class MainWindow(QMainWindow):
     def _response_finished(self, epoch: int, state: str) -> None:
         if epoch == self._active_epoch:
             self._end_reply(state)
+            self._answer_started = None
+            self._answer_text = "回答：" + state
+            self._refresh_activity()
 
     def _failed(self, text: str) -> None:
         self._failure = text
         self._end_reply("失败")
         self._active_epoch = -1
+        self._answer_started = None
+        self._answer_text = "回答：失败"
+        self._refresh_activity()
 
     def _worker_finished(self) -> None:
         worker, self.worker = self.worker, None

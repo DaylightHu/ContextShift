@@ -67,6 +67,8 @@ class AssistantWorker(QThread):
     request_failed = Signal(int, str)
     metrics = Signal(int, object)
     sources = Signal(int, object, float)
+    semantic_progress = Signal(object)
+    turn_progress = Signal(int, str)
 
     def __init__(self, options: DesktopOptions, parent=None) -> None:
         super().__init__(parent)
@@ -102,6 +104,11 @@ class AssistantWorker(QThread):
         def apply() -> None:
             new_root = index.root if index is not None else root
             self._repository = index
+            schedule_index = getattr(
+                getattr(self, "_provider", None), "set_index", None
+            )
+            if schedule_index is not None:
+                schedule_index(index)
             self._repository_pending = pending
             self._repository_revision += 1
             if new_root is None or new_root != self._repository_root:
@@ -158,7 +165,16 @@ class AssistantWorker(QThread):
         cancelled = threading.Event()
         explorer = getattr(self._provider, "explore_code", None)
         if explorer is not None:
-            bundle = await explorer(index, request.query, dialogue)
+            detailed = getattr(self._provider, "explore_code_with_progress", None)
+            if detailed is not None:
+                bundle = await detailed(
+                    index,
+                    request.query,
+                    dialogue,
+                    lambda stage: self.turn_progress.emit(epoch, stage),
+                )
+            else:
+                bundle = await explorer(index, request.query, dialogue)
         else:
             try:
                 bundle = await asyncio.to_thread(
@@ -184,6 +200,7 @@ class AssistantWorker(QThread):
             bundle.elapsed_seconds,
             len(bundle.references),
         )
+        self.turn_progress.emit(epoch, "云端生成回答，等待首字…")
         return ModelRequest(
             input=request.input + "\n\n" + bundle.text,
             instructions=request.instructions + PROJECT_INSTRUCTIONS,
@@ -275,6 +292,12 @@ class AssistantWorker(QThread):
         options = self.options
         provider = DeepSeekProvider(options.settings)
         self._provider = provider
+        set_progress = getattr(provider, "set_semantic_progress", None)
+        if set_progress is not None:
+            set_progress(self.semantic_progress.emit)
+        schedule_index = getattr(provider, "set_index", None)
+        if schedule_index is not None:
+            schedule_index(self._repository)
         session = Session(provider, context_resolver=self._resolve_context)
         request_started: float | None = None
         first_token: float | None = None
@@ -283,10 +306,12 @@ class AssistantWorker(QThread):
             nonlocal first_token
             if first_token is None and request_started is not None:
                 first_token = perf_counter() - request_started
+                self.turn_progress.emit(self._epoch, "云端正在输出回答")
             self.response.emit(self._epoch, event.text)
             self._reply_text += event.text
 
         def failed(exc: BaseException) -> None:
+            self.turn_progress.emit(self._epoch, "回答失败")
             self.response_finished.emit(self._epoch, "失败")
             if options.test_mode and self._announced_ready:
                 self.request_failed.emit(self._epoch, safe_error(exc))
@@ -295,6 +320,7 @@ class AssistantWorker(QThread):
             self._stop.set()
 
         def finished(result: TurnResult) -> None:
+            self.turn_progress.emit(self._epoch, "回答完成")
             cited = tuple(
                 dict.fromkeys(
                     int(n) - 1 for n in re.findall(r"\[S(\d+)\]", self._reply_text)
@@ -356,6 +382,7 @@ class AssistantWorker(QThread):
                 self._turn_sources = ()
                 self._epoch += 1
                 self.response_started.emit(self._epoch)
+                self.turn_progress.emit(self._epoch, "正在准备问题与代码上下文…")
 
         def transcript(event: TranscriptReady) -> None:
             if self._stop_requested.is_set():
