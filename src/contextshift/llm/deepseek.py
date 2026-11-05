@@ -1,6 +1,6 @@
 """DeepSeek implementation of the model provider interface."""
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 from openai import AsyncOpenAI
 
@@ -8,6 +8,7 @@ from contextshift.code_explorer import CodeExplorer
 from contextshift.config import Settings
 from contextshift.llm.base import ModelRequest, ProviderOutputLimit
 from contextshift.repository import RepositoryIndex, WorkspaceIndex
+from contextshift.semantic_index import SemanticIndex, SemanticProgress
 
 
 class DeepSeekProvider:
@@ -25,6 +26,15 @@ class DeepSeekProvider:
             base_url=settings.deepseek_base_url,
         )
         self._closed = False
+        self._semantic = SemanticIndex()
+
+    def set_index(self, index: RepositoryIndex | WorkspaceIndex | None) -> None:
+        self._semantic.schedule(index)
+
+    def set_semantic_progress(
+        self, callback: Callable[[SemanticProgress], None]
+    ) -> None:
+        self._semantic.set_progress_callback(callback)
 
     async def prepare(self) -> None:
         """Check authentication/model availability and warm the HTTP connection."""
@@ -95,13 +105,27 @@ class DeepSeekProvider:
         index: RepositoryIndex | WorkspaceIndex,
         query: str,
         dialogue: tuple[str, ...] = (),
+        on_progress: Callable[[str], None] | None = None,
     ):
         """Let the model search and read only selected workspace snapshots."""
         if self._closed:
             raise RuntimeError("DeepSeekProvider is closed")
-        return await CodeExplorer(index).explore(
-            self._client, model=self._settings.model, query=query, dialogue=dialogue
+        return await CodeExplorer(index, semantic=self._semantic).explore(
+            self._client,
+            model=self._settings.model,
+            query=query,
+            dialogue=dialogue,
+            on_progress=on_progress,
         )
+
+    async def explore_code_with_progress(
+        self,
+        index: RepositoryIndex | WorkspaceIndex,
+        query: str,
+        dialogue: tuple[str, ...],
+        on_progress: Callable[[str], None],
+    ):
+        return await self.explore_code(index, query, dialogue, on_progress=on_progress)
 
     async def close(self) -> None:
         """Close the reusable API client once."""
@@ -110,4 +134,5 @@ class DeepSeekProvider:
             return
 
         self._closed = True
+        self._semantic.close()
         await self._client.close()

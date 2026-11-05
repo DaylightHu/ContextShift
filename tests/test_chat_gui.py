@@ -26,6 +26,7 @@ from contextshift.repository import (
     SourceReference,
     WorkspaceIndex,
 )
+from contextshift.semantic_index import SemanticProgress
 from contextshift.speech.events import SpeechStarted, TranscriptReady
 
 
@@ -46,6 +47,25 @@ def wait_until(application, predicate, timeout=4):
 def settle(application):
     for _ in range(15):
         application.processEvents()
+
+
+def test_activity_panel_separates_index_and_current_answer(window):
+    window._semantic_progress(SemanticProgress("encoding", 64, 128, "mps", 32))
+    assert "64/128" in window.index_activity.text()
+    assert "MPS" in window.index_activity.text()
+    assert window.index_progress.isVisibleTo(window.activity)
+    window._ready = True
+    window._response_started(3)
+    window._turn_progress(2, "旧回答")
+    assert "旧回答" not in window.answer_activity.text()
+    window._turn_progress(3, "云端核实源码 · 第 2 轮")
+    assert "第 2 轮" in window.answer_activity.text()
+    assert "64/128" in window.index_activity.text()
+    window._semantic_progress(SemanticProgress("ready", 128, 128, "mps", 32))
+    assert "已就绪" in window.index_activity.text()
+    assert not window.index_progress.isVisibleTo(window.activity)
+    window._response_finished(3, "已完成")
+    assert "已完成" in window.answer_activity.text()
 
 
 @pytest.fixture
@@ -154,7 +174,11 @@ def test_main_window_contains_only_icons_and_message_content(window):
         for label in window.findChildren(QLabel)
         if label.isVisible() and not window.workspace.isAncestorOf(label)
     ]
-    assert visible_labels == ["●"]
+    assert visible_labels == [
+        "●",
+        "本地向量索引：等待工作区",
+        "回答：已完成",
+    ]
     assert [m.findChild(Avatar).role for m in window.feed.messages] == [
         "microphone",
         "computer",

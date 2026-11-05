@@ -21,6 +21,10 @@ desktop = [
     "watchfiles>=1.1,<2",
 ]
 bundle = ["pyinstaller>=6.12"]
+retrieval = [
+    "lancedb>=0.20,<1",
+    "sentence-transformers>=5,<6",
+]
 speech = [
     "funasr>=1.2.7",
     "numpy>=2.2.0",

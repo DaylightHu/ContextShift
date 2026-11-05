@@ -70,6 +70,7 @@ async def test_agent_follows_names_across_selected_roots_and_verifies_lines(tmp_
         ]
     )
     requests = []
+    stages = []
 
     async def create(**kwargs):
         requests.append({**kwargs, "input": list(kwargs["input"])})
@@ -77,8 +78,11 @@ async def test_agent_follows_names_across_selected_roots_and_verifies_lines(tmp_
         return SimpleNamespace(output=output, output_text="调用入口和端点已确认")
 
     api = SimpleNamespace(responses=SimpleNamespace(create=create))
-    bundle = await explorer.explore(api, model="test-model", query="入口如何联动端点？")
+    bundle = await explorer.explore(
+        api, model="test-model", query="入口如何联动端点？", on_progress=stages.append
+    )
     assert len(requests) == 3
+    assert stages == [f"云端核实源码 · 第 {n} 轮" for n in (1, 2, 3)]
     assert "P1/Client.java:1" in requests[1]["input"][-1]["output"]
     assert {reference.workspace for reference in bundle.references} == {
         str(client_root),
@@ -135,6 +139,35 @@ async def test_explorer_receives_more_recent_actual_utterances(tmp_path):
     assert "utterance-3" not in input_text
     assert "utterance-19" in input_text
     assert "Recent actual utterances" in input_text
+
+
+@pytest.mark.asyncio
+async def test_semantic_candidates_are_leads_and_require_original_lines(tmp_path):
+    index = RepositoryIndex(
+        tmp_path,
+        (),
+        "",
+        {"Client.java": _file("Client.java", "service.vehicleInfo(id);")},
+    )
+    semantic = SimpleNamespace(
+        search=lambda scope, question: [
+            ("P1/Client.java", 1, 1),
+            ("P1/private.env", 1, 1),
+        ]
+    )
+    explorer = CodeExplorer(index, semantic=semantic)
+    requests = []
+
+    async def create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(output=[], output_text="guess")
+
+    api = SimpleNamespace(responses=SimpleNamespace(create=create))
+    bundle = await explorer.explore(api, model="test", query="vehicle data")
+    assert "P1/Client.java:1-1" in requests[0]["input"][0]["content"]
+    assert "private.env" not in requests[0]["input"][0]["content"]
+    assert not bundle.references
+    assert "未能从已选文件中核实" in bundle.text
 
 
 @pytest.mark.asyncio
